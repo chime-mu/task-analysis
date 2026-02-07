@@ -4,7 +4,9 @@
 
 The Claude Code **task system** is a mechanism by which the Claude Code agent manages structured work items during coding sessions. It provides tools for creating, tracking, updating, and listing tasks with support for dependencies (blocking/blocked-by relationships), lifecycle state transitions, file-level locking for concurrent access, and progress display. The task system enables Claude Code to break complex user requests into discrete, trackable units of work, coordinate execution across multi-agent teams, and display progress to the user via a terminal status line.
 
-This document is based on **actual source code analysis** of the Claude Code v2.1.34 production binary (build 2026-02-06T06:37:05Z), extracted via `strings` on the Mach-O arm64 Bun-compiled binary with pattern-matched deobfuscation. The companion source analysis document is at `task-system-source-analysis.md`. All code snippets are deobfuscated reconstructions with variable names mapped to their functional equivalents.
+The system encompasses far more than just task CRUD operations. It includes a **task reminder system** (nudges agents to use task tools after 10+ idle turns), **agent stop hooks** (spawns sub-agents to verify completion conditions before allowing task state changes), **plan mode integration** (structured planning workflow with team-lead approval), **idle notification system** (automatic notifications when teammates finish their turns), an **in-process teammate system** (teammates running in the same process), **delegate mode** (delegation-specific team context), and a comprehensive **attachment system** (29 distinct types injected into the model's context per turn).
+
+This document is based on **actual source code analysis** of the Claude Code v2.1.34 production binary (build 2026-02-06T06:37:05Z), extracted via `strings` on the Mach-O arm64 Bun-compiled binary with pattern-matched deobfuscation, combined with **filesystem analysis** of the `~/.claude/` directory structure (tasks, todos, plans). The companion source analysis document is at `task-system-source-analysis.md`. All code snippets are deobfuscated reconstructions with variable names mapped to their functional equivalents.
 
 ---
 
@@ -24,9 +26,20 @@ This document is based on **actual source code analysis** of the Claude Code v2.
 12. [Background Task System](#background-task-system)
 13. [Team System](#team-system)
 14. [Task Notifications and Queue System](#task-notifications-and-queue-system)
-15. [UI Rendering](#ui-rendering)
-16. [Environment Variables and Configuration](#environment-variables-and-configuration)
-17. [Obfuscated Symbol Map](#obfuscated-symbol-map)
+15. [Task Reminder System](#task-reminder-system)
+16. [Agent Stop Hooks (Completion Verification)](#agent-stop-hooks-completion-verification)
+17. [Plan Mode Integration](#plan-mode-integration)
+18. [Team System (Expanded)](#team-system-expanded)
+19. [Idle Notification System](#idle-notification-system)
+20. [In-Process Teammate System](#in-process-teammate-system)
+21. [Delegate Mode](#delegate-mode)
+22. [Attachment System](#attachment-system)
+23. [TaskStop Tool](#taskstop-tool)
+24. [TodoWrite Persistence on Disk](#todowrite-persistence-on-disk)
+25. [Plans Directory](#plans-directory)
+26. [UI Rendering](#ui-rendering)
+27. [Environment Variables and Configuration](#environment-variables-and-configuration)
+28. [Obfuscated Symbol Map](#obfuscated-symbol-map)
 
 ---
 
@@ -1134,9 +1147,9 @@ Note: `TaskOutput` is **always enabled** (`isEnabled() { return true }`), unlike
 
 ---
 
-## Team System
+## Team System (Core)
 
-The task system integrates with Claude Code's team/swarm capabilities through several mechanisms.
+The task system integrates with Claude Code's team/swarm capabilities through several mechanisms. See also [Team System (Expanded)](#team-system-expanded) for details on SendMessage, team lead role, and agent naming.
 
 ### Team Context
 
@@ -1163,9 +1176,9 @@ function d9() { /* is swarm mode active */ }
 
 The source analysis reveals team management tools exist alongside the task tools:
 
-- **TeamCreate**: Creates a new team of agents
-- **TeamDelete**: Removes a team
-- **SendMessage**: Sends messages between agents in a team
+- **TeamCreate**: Creates a new team of agents (a leader can only manage one team at a time)
+- **TeamDelete**: Removes a team (must delete current team before creating a new one)
+- **SendMessage**: Sends messages between agents in a team (supports `broadcast` and `message` types)
 
 These tools work alongside the shared task list -- a team shares a single task list identified by the team name, and agents coordinate through claiming, ownership, and the notification system.
 
@@ -1232,6 +1245,443 @@ function NG(T, R) {
 ```
 
 Task notifications are prioritized over regular queued commands when there are active listeners.
+
+The `"task-notification"` mode is a member of a special set of command types:
+
+```javascript
+yL7 = new Set(["task-notification"])
+```
+
+This ensures task notifications are treated as a distinct category from regular queued commands.
+
+### Task Completion Notifications
+
+When a task completes, a structured notification is created:
+
+```javascript
+createTaskCompletedNotification()  // Creates notification when a task completes
+isTaskCompletedNotification()      // Checks if a message is a task completion notification
+executeTaskCompletedHooks()        // Runs hooks after task completion
+getTaskCompletedHookMessage()      // Gets the hook message for completed tasks
+```
+
+The system prompt instructs agents:
+> Do NOT send structured JSON status messages like `{"type":"idle",...}` or `{"type":"task_completed",...}`. Just communicate in plain text when you need to message teammates. Use TaskUpdate to mark tasks completed and the system will automatically send idle notifications when you stop.
+
+---
+
+## Task Reminder System
+
+The system periodically reminds agents about their tasks if they haven't used task management tools recently. Two parallel reminder systems exist for the two task-tracking systems.
+
+### Reminder Configuration Constants
+
+```javascript
+// For both TodoWrite and Task tools:
+nIR = {
+    TURNS_SINCE_WRITE: 10,       // Minimum turns since last task write
+    TURNS_BETWEEN_REMINDERS: 10  // Minimum turns between reminder injections
+}
+
+// For task progress reporting:
+N78 = 3  // Minimum turns before re-reporting progress
+```
+
+### Reminder Logic
+
+The reminder fires when:
+1. `turnsSinceLastTaskManagement >= 10` (agent hasn't used TodoWrite/TaskCreate/TaskUpdate for 10+ turns), AND
+2. `turnsSinceLastReminder >= 10` (last reminder was 10+ turns ago)
+
+When triggered, the system injects an attachment into the model's context:
+
+**TodoWrite reminder** (`todo_reminder`):
+```javascript
+{
+    type: "todo_reminder",
+    content: "...",     // Formatted list of current todos
+    itemCount: N        // Number of items in the list
+}
+```
+
+**Task reminder** (`task_reminder`):
+```javascript
+{
+    type: "task_reminder",
+    content: "...",     // Formatted as: "#<id>. [<status>] <subject>"
+    itemCount: N
+}
+```
+
+### Task Progress Monitoring
+
+For background tasks, the system creates progress attachments:
+
+```javascript
+// task_status -- Final status with deltaSummary (output delta)
+// task_progress -- Running task progress messages, re-reported every N78=3 turns
+```
+
+---
+
+## Agent Stop Hooks (Completion Verification)
+
+The completion verification system (`evT`) mentioned in TaskUpdate is backed by a sophisticated "agent stop hook" system. This spawns a **separate sub-agent** that evaluates whether conditions are met before allowing an action (like marking a task complete) to proceed.
+
+### Hook Agent Configuration
+
+```javascript
+{
+    agentId: "hook-agent-<uuid>",
+    isNonInteractiveSession: true,
+    maxThinkingTokens: 0,
+    mode: "dontAsk",        // Permission mode: auto-approves all tools
+    maxTurns: 50,           // Maximum turns before forced abort
+    querySource: "hook_agent"
+}
+```
+
+### Hook Outcomes
+
+| Outcome | Meaning |
+|---------|---------|
+| `"success"` | Condition met, the action proceeds |
+| `"blocking"` | Condition not met; returns `blockingError` with a reason string |
+| `"cancelled"` | Max turns hit or no structured output returned |
+| `"non_blocking_error"` | Exception during execution |
+
+### Structured Output Schema
+
+The hook agent must return:
+
+```javascript
+{ ok: true }                      // Condition met, proceed
+{ ok: false, reason: "..." }     // Condition not met, block with reason
+```
+
+### Telemetry Events
+
+```
+tengu_agent_stop_hook_max_turns   // Hook hit max turns limit
+tengu_agent_stop_hook_error       // Hook encountered an error
+tengu_agent_stop_hook_success     // Hook completed successfully
+```
+
+---
+
+## Plan Mode Integration
+
+The task system integrates with Claude Code's plan mode, which provides a structured workflow for designing implementation approaches before writing code.
+
+### Plan Mode Tools
+
+```javascript
+var J5R = "EnterPlanMode";   // Enters plan mode
+var C5R = "ExitPlanMode";    // Exits plan mode (requests approval)
+```
+
+### Plan File Storage
+
+Plans are stored as markdown files at `~/.claude/plans/<slug>.md`, where `<slug>` is a randomly generated adjective-adjective-noun name (similar to Docker container names):
+
+```
+~/.claude/plans/
+  bubbly-fluttering-hippo.md
+  compiled-cooking-giraffe.md
+  distributed-inventing-minsky.md
+  elegant-munching-river.md
+  ...
+```
+
+Plans are plain markdown with no frontmatter. They follow a consistent structure with sections like Summary, Implementation Steps, Files to Modify/Create, and Verification.
+
+### Plan Mode System Prompt
+
+When plan mode is active, the model receives:
+
+> Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supercedes any other instructions you have received.
+
+### Plan Mode Reminder Configuration
+
+```javascript
+MUB = {
+    TURNS_BETWEEN_ATTACHMENTS: 5,            // Inject reminder every 5 turns
+    FULL_REMINDER_EVERY_N_ATTACHMENTS: 5     // Full reminder vs sparse reminder cycle
+}
+```
+
+The system alternates between `"full"` and `"sparse"` reminders every N attachments, injected as `plan_mode` and `plan_mode_exit` attachment types.
+
+### Team Plan Approval
+
+In team mode, plan approval is coordinated with the team lead:
+
+```javascript
+// Plan approval request format:
+{"type": "plan_approval_request", ...}
+
+// InboxPoller messages:
+"[InboxPoller] Plan approved by team lead, exited plan mode to..."
+"[InboxPoller] Plan rejected by team lead: ..."
+"[InboxPoller] Received plan approval response from team-lead: approved=..."
+```
+
+---
+
+## Team System (Expanded)
+
+### Team Structure
+
+Teams are stored at `~/.claude/teams/{team-name}/`:
+
+```
+~/.claude/teams/
+  {team-name}/
+    config.json       # Team configuration
+```
+
+### Team Context Attachment
+
+On each turn, teammates receive a `team_context` attachment (function `$88()`):
+
+```javascript
+{
+    type: "team_context",
+    agentId: "...",
+    agentName: "...",
+    teamName: "...",
+    teamConfigPath: "~/.claude/teams/{team-name}/config.json",
+    taskListPath: "~/.claude/tasks/{team-name}/"
+}
+```
+
+This attachment is injected **only on the first turn** (not when previous assistant messages exist in the conversation).
+
+### SendMessage Tool
+
+Agents communicate via the `SendMessage` tool with two message types:
+
+| Type | Purpose |
+|------|---------|
+| `broadcast` | Team-wide announcements (use sparingly) |
+| `message` | Direct messages to specific teammates |
+
+System prompt guidance:
+> Your team cannot hear you if you do not use the SendMessage tool. Always send a message to your teammates if you are responding to them.
+
+### Team Lead Role
+
+The team lead has special privileges:
+
+- Creates and deletes teams (`TeamCreate`, `TeamDelete`)
+- Can only manage one team at a time
+- Approves or rejects plans from teammates
+- Receives idle notifications from teammates when their turns end
+- `InboxPoller` only accepts mode changes and plan approval from team-lead
+- Referenced as `"team-lead"` (agents should use names, never UUIDs)
+
+### Agent Naming Convention
+
+> IMPORTANT: Always refer to teammates by their NAME (e.g., "team-lead", "researcher", "tester"), never by UUID.
+
+---
+
+## Idle Notification System
+
+The system automatically sends idle notifications when a teammate's turn ends.
+
+### Behavior
+
+> Idle notifications are automatic. The system sends an idle notification whenever a teammate's turn ends. You do not need to react to idle notifications unless you want to assign new work or send a follow-up message.
+
+### Peer DM Visibility
+
+> When a teammate sends a DM to another teammate, a brief summary is included in their idle notification. This gives you visibility into peer collaboration without the full message content.
+
+### Implementation Details
+
+```javascript
+// Log messages:
+"[inProcessRunner] Skipping duplicate idle notification for..."
+"[TeammateInit] Sent idle notification to leader"
+"[TeammateInit] This agent is the team leader - skipping idle notification hook"
+```
+
+The team leader is exempt from sending idle notifications (since it would be notifying itself).
+
+---
+
+## In-Process Teammate System
+
+Teammates can run as in-process agents (sharing the same Node.js process) or as separate processes. In-process teammates use the `"t"` prefix for their background task IDs.
+
+### Lifecycle Functions
+
+```javascript
+spawnInProcessTeammate()              // Spawns and registers a teammate
+getAllInProcessTeammateTasks()         // Gets all running in-process teammate tasks
+completeTeammateTask()                // Mark teammate task as completed
+failTeammateTask()                    // Mark teammate task as failed
+findTeammateTaskByAgentId()           // Lookup teammate task by agent ID
+extractTeammateTranscriptsFromTasks() // Get transcripts from teammate tasks
+```
+
+### SendMessage Integration
+
+```javascript
+// Log messages from SendMessage tool:
+"[SendMessageTool] Aborted controller for in-process teammate"
+"[SendMessageTool] Fallback: Found in-process task for..."
+"[SendMessageTool] handleShutdownApproval: teamName=..."
+"[SendMessageTool] In-process teammate..."
+"[SendMessageTool] Warning: Could not find task/abortController for..."
+```
+
+---
+
+## Delegate Mode
+
+A `delegate_mode` attachment type exists alongside `delegate_mode_exit`, used within the team context:
+
+```javascript
+{ type: "delegate_mode", teamName: "...", taskListPath: "..." }
+```
+
+This appears to be a mode where the team lead delegates specific tasks to teammates, with the task list path provided for coordination. The exact behavioral differences from standard team mode are controlled by the attachment content injected into the model's context.
+
+---
+
+## Attachment System
+
+The complete list of attachment types injected into the model's context per turn:
+
+### All Attachment Types (29 types)
+
+| Attachment Type | Category | Description |
+|----------------|----------|-------------|
+| `agent_mentions` | Context | Referenced agents in conversation |
+| `async_hook_response` | Hooks | Responses from async hooks |
+| `at_mentioned` | Context | Files referenced via @ mentions |
+| `budget_usd` | Resource | Budget/spending information |
+| `changed_files` | Context | Files modified since last turn |
+| `compact_file_reference` | Context | Compressed file references |
+| `delegate_mode` | Mode | Delegate mode context injection |
+| `diagnostics` | Debug | Diagnostic information |
+| `dynamic_skill` | Skills | Dynamically loaded skill context |
+| `hook_blocking_error` | Hooks | Error from a blocking hook |
+| `hook_non_blocking_error` | Hooks | Non-blocking hook error |
+| `hook_success` | Hooks | Successful hook execution |
+| `ide_selection` | IDE | Current editor selection |
+| `lsp_diagnostics` | IDE | Language server protocol diagnostics |
+| `mcp_resources` | MCP | Resources from MCP servers |
+| `nested_memory` | Memory | Memory files (MEMORY.md, etc.) |
+| `output_style` | Config | Output style preferences |
+| `plan_mode_exit` | Mode | Plan mode exit context |
+| `queued_commands` | Queue | Pending queued commands |
+| `skill_listing` | Skills | Available skills list |
+| `structured_output` | Config | Structured output format requirements |
+| `task_progress` | Tasks | Background task progress updates |
+| `task_reminder` | Tasks | Reminder to use task management tools |
+| `task_status` | Tasks | Background task final status |
+| `team_context` | Team | Team membership and config info |
+| `teammate_mailbox` | Team | Messages from teammates |
+| `todo_reminder` | Tasks | Reminder to use TodoWrite |
+| `token_usage` | Resource | Token consumption stats |
+| `unified_tasks` | Tasks | Combined task_status + task_progress |
+
+---
+
+## TaskStop Tool
+
+The `TaskStop` tool allows stopping running background tasks:
+
+```javascript
+var a2T = "TaskStop";
+```
+
+Usage context from the system:
+> It is still running. Use TaskStop to stop it first, or wait for it to complete.
+
+This tool is used to terminate long-running background bash commands or agent sessions that are no longer needed.
+
+---
+
+## TodoWrite Persistence on Disk
+
+While TodoWrite's primary storage is in-memory (`AppState.todos[agentId]`), there is a **filesystem persistence layer** at `~/.claude/todos/`.
+
+### Directory Structure
+
+```
+~/.claude/todos/
+  {sessionId}-agent-{agentId}.json    # Per-agent todo list
+```
+
+### File Naming Convention
+
+Files follow the pattern `{sessionId}-agent-{agentId}.json` where both IDs are UUIDs. In most cases, the session ID and agent ID are the same (self-reference for the main agent). When sub-agents are involved, the agent ID differs from the session ID.
+
+### Observed Statistics (from live system)
+
+- **6,062 files** total
+- **98% empty** (2 bytes, containing `[]`) -- these represent cleared/completed sessions
+- **~2% non-empty** (~126 files) -- these contain active or abandoned todo lists
+- One anomalous file with a truncated agent ID (`ad50bf6` instead of a full UUID)
+
+### File Content Format
+
+Non-empty files contain a JSON array matching the TodoWrite schema:
+
+```json
+[
+  {
+    "content": "Fix the login bug",
+    "status": "completed",
+    "activeForm": "Fixing the login bug"
+  },
+  {
+    "content": "Write unit tests",
+    "status": "in_progress",
+    "activeForm": "Writing unit tests"
+  }
+]
+```
+
+Empty files contain `[]`, matching the auto-clear behavior (all items completed -> stored as `[]`).
+
+Note: The `todos/` path string does not appear in the binary itself, suggesting this persistence may be handled by a separate module or framework-level serialization of the app state.
+
+---
+
+## Plans Directory
+
+Claude Code stores implementation plans in `~/.claude/plans/` as markdown files.
+
+### Naming Convention
+
+Plan files use randomly generated **adjective-gerund-noun** slugs:
+
+```
+bubbly-fluttering-hippo.md
+compiled-cooking-giraffe.md
+distributed-inventing-minsky.md
+elegant-munching-river.md
+federated-wandering-swan.md
+```
+
+The noun component sometimes uses famous computer scientist names (Milner, Minsky, Clarke, Knuth, Moore, etc.).
+
+### File Format
+
+- Plain Markdown, no frontmatter or metadata headers
+- Consistent hierarchical structure with H1 title and H2 sections
+- Common sections: Summary, Critical Files, Implementation Steps/Phases, Verification
+- May include inline code snippets (SQL, Elixir, TypeScript, etc.)
+- No date, author, or status fields
+
+### Relationship to Task System
+
+Plans are created during `EnterPlanMode` and approved via `ExitPlanMode`. The plan file path is provided to the model in `plan_mode` attachments. In team mode, plan approval flows through the team lead via `plan_approval_request` messages.
 
 ---
 
@@ -1394,6 +1844,38 @@ Key variable/function mappings discovered in the v2.1.34 binary. These are usefu
 | `NG` | Enqueue command/notification |
 | `evT` | Task completion verification hook iterator |
 | `tvT` | Format blocking error message |
+| `yL7` | Special command type set (`Set(["task-notification"])`) |
+
+### Reminder System
+
+| Obfuscated | Purpose |
+|-----------|---------|
+| `nIR` | Task reminder config (`{TURNS_SINCE_WRITE: 10, TURNS_BETWEEN_REMINDERS: 10}`) |
+| `N78` | Task progress minimum turns between reports (`3`) |
+| `I78` | Additional reminder config (`{TURNS_BETWEEN_REMINDERS: 10}`) |
+| `K78` | Token cooldown config (`{TOKEN_COOLDOWN: 5000}`) |
+
+### Plan Mode
+
+| Obfuscated | Purpose |
+|-----------|---------|
+| `J5R` | EnterPlanMode tool name |
+| `C5R` / `YN` / `eJ` | ExitPlanMode tool name (multiple references) |
+| `MUB` | Plan mode reminder config (`{TURNS_BETWEEN_ATTACHMENTS: 5, FULL_REMINDER_EVERY_N_ATTACHMENTS: 5}`) |
+
+### Tools
+
+| Obfuscated | Purpose |
+|-----------|---------|
+| `D6` | AskUserQuestion tool name |
+| `Pk_` | AskUserQuestion max questions/choices (`12`) |
+| `a2T` | TaskStop tool name |
+
+### Team System
+
+| Obfuscated | Purpose |
+|-----------|---------|
+| `$88` | Function that creates `team_context` attachment |
 
 ---
 
@@ -1433,4 +1915,4 @@ The AI agent decides when to create tasks, how to decompose work, and when to up
 
 ---
 
-*Based on source code analysis of Claude Code v2.1.34 binary (build 2026-02-06T06:37:05Z). All code snippets are deobfuscated reconstructions from `strings` extraction with variable names mapped to functional equivalents. See `task-system-source-analysis.md` for the complete analysis.*
+*Based on source code analysis of Claude Code v2.1.34 binary (build 2026-02-06T06:37:05Z) and filesystem analysis of `~/.claude/` directory structure. All code snippets are deobfuscated reconstructions from `strings` extraction with variable names mapped to functional equivalents. See `task-system-source-analysis.md` for the complete source analysis.*
