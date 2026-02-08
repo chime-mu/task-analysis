@@ -101,6 +101,29 @@ This is the essential mechanism by which a cybernetic system can adapt to enviro
 
 ---
 
+## 5a. The Double Loop: Iterative Convergence
+
+Ashby's ultrastability (Section 5) describes the *mechanism* for structural adaptation — step-function parameter changes when first-order regulation fails. But it does not name the *learning process* that drives it. Chris Argyris's distinction between single-loop and double-loop learning fills this gap.
+
+**Single-loop learning**: detect an error, correct it within the existing frame. The thermostat model. The goal, the approach, and the success criteria remain fixed — only the execution is adjusted. "We failed. Try again."
+
+**Double-loop learning**: detect an error, question the frame that produced it. Examine whether the goal is correct, whether the approach is appropriate, whether the success criteria are measuring the right thing. "We failed. Are we solving the right problem?"
+
+Applied to agent orchestration:
+
+- **Single-loop**: an agent fails a task → retry the same task with the same parameters. The orchestrator corrects execution errors (timeouts, transient failures, resource contention) without questioning the task definition.
+- **Double-loop**: an agent fails a task → evaluate *why* → adjust the task definition, the decomposition, the agent selection, or the constraints → re-dispatch with a revised approach. The orchestrator questions whether the task was well-formed, whether the agent was appropriate, whether the problem was correctly scoped.
+
+This is the mechanism that Gorelkin's meta-policy section describes but does not operationalize. Meta-policies govern *when* the control architecture changes — but the double loop describes *how* the system detects that a change is needed and *what kind* of change to make.
+
+The cybernetic orchestrator is not a workflow replayer — it is a feedback controller. It observes the error signal (gap between goal and result), classifies the error (execution failure vs approach failure), applies the appropriate correction (retry vs reframe), and re-dispatches. The process is iterative convergence, not deterministic replay. You do not need to reproduce the exact sequence of steps; you need to approach the right result through successive corrections.
+
+The autonomy envelope (Section 3) is the boundary condition for this loop. The feedback controller operates within the envelope — adjusting tasks, selecting agents, modifying parameters. If the loop fails to converge within the envelope (the error signal does not diminish, or the corrections exhaust available options), it escalates: an algedonic signal to System 5 (the human), requesting either a wider envelope or a redefinition of the goal.
+
+This resolves Gap #4 (Section 8, model degradation): the double loop *is* the mechanism for detecting when the model is wrong. Single-loop failures that accumulate — tasks that repeatedly fail despite retries — are the signal that triggers double-loop evaluation. The system does not merely adjust parameters; it evaluates results against goals and adjusts the model itself. Model degradation becomes detectable not through a separate monitoring system but through the convergence behavior of the feedback loop: a model that no longer fits the environment produces a loop that fails to converge.
+
+---
+
 ## 6. Variety Engineering: The Core Regulatory Problem
 
 Underlying the entire architecture is Ashby's **Law of Requisite Variety**: a regulator must have at least as much variety as the system it regulates. Gorelkin addresses this through several mechanisms:
@@ -143,7 +166,7 @@ Several cybernetic issues are underspecified:
 
 3. **Conflict between System 3 and System 4.** Beer identified the S3-S4 tension (exploitation vs exploration, present vs future) as the central regulatory dilemma of viable systems. Gorelkin's architecture has no explicit mechanism for resolving this tension — it is left to System 5, which merely "defines identity." In practice, this tension is where organizations break.
 
-4. **Model degradation.** The Conant-Ashby theorem requires that the internal model be a good model of the environment. Models decay. There is no explicit mechanism for detecting when the system's world-model has become pathologically inaccurate — only post-hoc evaluation loops.
+4. **Model degradation.** The Conant-Ashby theorem requires that the internal model be a good model of the environment. Models decay. Section 5a's double-loop learning provides the detection mechanism: single-loop failures that accumulate signal that the model, not the execution, is wrong. The double loop then triggers reframing — adjusting the model itself. However, the operationalization remains underspecified: what metrics distinguish "execution failed, retry" (single-loop) from "approach is wrong, reframe" (double-loop)? The threshold between parameter adjustment and frame shift is the critical design decision, and Gorelkin does not address it.
 
 5. **Autopoietic closure.** The biological metaphor implies autopoiesis — a system that produces the components that produce it. But the architecture is allopoietic: it is designed, deployed, and maintained by external agents (human engineers). The "living" metaphor is aspirational rather than structural. True autopoiesis would require the system to modify its own architecture, not merely its parameters — which the meta-policy layer approaches but does not achieve.
 
@@ -166,6 +189,7 @@ Several cybernetic issues are underspecified:
 | Policy objects | Control law / control surface | Control theory |
 | Meta-policies | Second-order regulation | von Foerster |
 | Autonomy expansion/contraction | Ultrastable parameter change | Ashby |
+| (implied but unnamed) | Double-loop learning / iterative convergence | Argyris |
 | Multi-agent ensemble | Variety generator / parallel regulators | Ashby |
 | Universal supervisor | Local governor / homeostatic regulator | Ashby-Beer |
 | Pod hierarchy (pod → dept → enterprise) | Recursive viable system structure | Beer |

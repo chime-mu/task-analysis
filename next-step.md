@@ -18,12 +18,14 @@ The three-layer architecture described in `task-system-comparison.md` (Execution
 | System 2 (Coordination) | Anti-oscillation: file locking, atomic claiming, dependency enforcement | Execution | Claude Code Tasks |
 | System 3 (Control) | Internal regulation: what work exists, what is ready, what is blocked | Planning | Beads |
 | System 3* (Audit) | Sporadic monitoring: compaction, content hashing, ready computation | Planning | Beads |
-| System 4 (Intelligence) | Environmental scanning: crash detection, retry logic, multi-provider routing | Orchestration | Temporal |
+| System 4 (Intelligence) | Feedback evaluation: comparing results against goals, detecting stalls, adjusting dispatch parameters | Orchestration | Feedback controller |
 | System 5 (Policy) | Identity and boundaries: what the system is and is not allowed to do | Human governance | You |
 
 **Ashby's Law of Requisite Variety** is the principle that connects these layers to the orchestration problem. A regulator must have at least as much variety as the system it regulates. Deterministic orchestrators (scripts, Temporal Workflows) have the *right variety profile* for workflow control: they produce exactly the variety needed (retry, re-dispatch, route) and no more. Probabilistic agents produce *too much* variety for this role — they forget instructions, skip steps, hallucinate workflow states. This is why `orchestration-principle.md` argues that orchestration belongs in deterministic systems, not in agents. It is Ashby's Law applied.
 
-**The autonomy envelope** — the set of constraints defining what an agent may do within a session (permitted tools, spending thresholds, escalation paths, stop conditions) — is a homeostatic boundary in Ashby's sense. The agent is free to vary within the envelope; crossing it triggers corrective action. Claude Code's task system operates inside this envelope. The orchestrator defines the envelope. You (System 5) define the orchestrator's boundaries. See `goal-cybercontrol.md` for the full cybernetic argument.
+**The autonomy envelope** — the set of constraints defining what an agent may do within a session (permitted tools, spending thresholds, escalation paths, stop conditions) — is a homeostatic boundary in Ashby's sense. The agent is free to vary within the envelope; crossing it triggers corrective action. Claude Code's task system operates inside this envelope. The orchestrator defines the envelope. You (System 5) define the orchestrator's boundaries.
+
+**The orchestration loop is not workflow replay — it is iterative convergence.** Dispatch a task, evaluate the result, adjust, re-dispatch. Single-loop: correct execution errors (retry failures, adjust parameters). Double-loop: question whether you're solving the right problem (reframe the task, change the agent, revise the decomposition). This is Argyris's distinction applied to agent orchestration, and it is the mechanism that makes cybernetic control practical. You don't need deterministic replay of identical steps — you need a feedback loop that converges on the right result through successive corrections. See `goal-cybercontrol.md` Section 5a for the full argument.
 
 ---
 
@@ -118,37 +120,35 @@ Use Beads as the persistent multi-project backend. Use Claude Code's Tasks for i
 
 **When to use**: Multi-project work, cross-session continuity needed, team backlogs. The sweet spot for most developers managing 2+ projects with AI agents.
 
-### 3. Full Stack — Claude Code + Orchestrator (+ Beads)
+### 3. Full Stack — Feedback Controller (+ Beads)
 
 **VSM coverage**: Systems 1-5 (all layers, with you as System 5)
 
-Add a deterministic orchestrator that owns the workflow. Agents are workers receiving tasks and returning results. The orchestrator handles progress tracking, crash recovery, retries, and "what next" logic.
+The orchestrator is a feedback controller: dispatch a task, evaluate the result against goals, adjust, re-dispatch. This is the cybernetic loop applied to agent orchestration. It is simpler, cheaper, and more principled than a workflow replay engine.
 
-Two concrete implementations:
+**Primary: Feedback controller script** — A shell/Python script that implements the dispatch-evaluate-adjust cycle. It reads a task file, dispatches work to agents via CLI, evaluates results (exit codes, output inspection, test results), and decides what to do next. Your own state (files, SQLite, YAML — not `~/.claude/`). Switching agents = changing a command.
 
-**3a. Simple Script Orchestrator** — A shell/Python script that reads a task file, dispatches work to agents via CLI, tracks completion. Your own state (files, SQLite, YAML — not `~/.claude/`). Switching agents = changing a command. If an agent crashes, the script knows what was in progress and re-dispatches.
+The feedback controller handles:
+- **Crash recovery**: scan for stalled tasks (no heartbeat, exceeded timeout), re-dispatch with context about what failed. No replay needed — the loop converges by retrying with better information, not by reproducing identical steps.
+- **Vendor independence**: dispatches to any CLI agent (`claude`, `codex`, `aider`, etc.). The agent is an Activity; the controller is the loop.
+- **Single-loop correction**: task failed → retry with same parameters (transient failure, timeout, resource contention).
+- **Double-loop correction**: task failed repeatedly → evaluate why → adjust the task definition, change the agent, revise the decomposition → re-dispatch with revised approach.
 
-- Effort: 2-3 days
+Effort: 2-3 days.
+
+**Tradeoffs**:
 - (+) Vendor-independent, minimal infrastructure, no server
-- (-) Limited crash recovery — can re-dispatch but no replay of partial work
+- (+) Principled: implements the cybernetic model directly
+- (+) Handles crash recovery via timeout + re-dispatch (sufficient for most cases)
+- (+) Double-loop: can change approach when stuck, not just retry
 - (-) You build and maintain it yourself
+- (-) No replay of partial work within a single agent invocation (but the loop compensates by re-dispatching with context)
 
-**3b. Temporal (Durable Execution)** — Temporal (temporal.io) guarantees Workflows run to completion through deterministic replay and automatic retry. Agents are Activities; if a Worker crashes, another replays from event history, skipping completed steps. OpenAI Codex and Replit Agent 3 run on it in production.
+Optionally add Beads (Approach 2) for the planning layer. Beads handles "what work exists?"; the feedback controller handles "dispatch, evaluate, adjust"; Claude Code handles "how does the agent organize work within a session?"
 
-- Effort: ~1 week setup; infrastructure at ~$100/month (Cloud) or self-hosted
-- (+) Automatic crash recovery with partial-work preservation
-- (+) Multi-agent routing via Task Queues (Claude for reasoning, cheaper model for boilerplate)
-- (+) Human-in-the-loop via Signals, complete auditability
-- (+) Production-proven at scale
-- (-) Infrastructure cost and operational burden
-- (-) Steep learning curve (determinism constraints, event sourcing, Workflow versioning)
-- (-) Overkill for solo developer with short sessions
+**For production/enterprise systems**: Temporal (temporal.io) remains an option for cases requiring guaranteed completion of fixed, deterministic workflows — CI/CD pipelines, deployment sequences, compliance-critical processes where every step must execute exactly once in order. See `temporal-analysis.md`. But Temporal's model (deterministic replay of fixed workflows) is not the general recommendation for agent orchestration, where the work is inherently exploratory and the right approach emerges through iteration, not replay.
 
-Add Beads (Approach 2) for the planning layer regardless of which orchestrator you choose. Temporal handles "did this complete?"; Beads handles "what work exists?"; Claude Code handles "how does the agent organize work right now?" This is the three-layer stack from `task-system-comparison.md`.
-
-See `temporal-analysis.md` for the full Temporal analysis.
-
-**When to use**: Crash recovery matters. Multiple agent providers. Production systems (CI/CD, deployments). Multi-agent routing across machines. Long-running, multi-step workflows where losing progress is more expensive than infrastructure cost.
+**When to use**: Crash recovery matters. Multiple agent providers. Long-running, multi-step workflows. Any case where you need the orchestration loop — dispatch, evaluate, adjust — to be deterministic and vendor-independent.
 
 ---
 
@@ -159,11 +159,11 @@ See `temporal-analysis.md` for the full Temporal analysis.
 | 1 project, short sessions | Systems 1+2 | **1. Execution Only** — built-in tasks + task list in repo |
 | 1 project, cross-session work | Systems 1+2+3 | **2. Execution + Planning** — add Beads, or keep task list in repo with Approach 1 |
 | 2+ projects, multi-session | Systems 1+2+3+3* | **2. Execution + Planning** — Beads for multi-project backlog |
-| Multiple agents across machines | Systems 1-4 | **3. Full Stack** — Temporal (3b) + Beads |
-| Multiple agent providers | Systems 1-4 | **3. Full Stack** — Temporal wraps any CLI agent as an Activity |
-| Production system (CI/CD, deployments) | Systems 1-5 | **3. Full Stack** — Temporal (3b) for guaranteed completion |
-| Crash recovery is critical | Systems 1-4 | **3. Full Stack** — only Temporal (3b) preserves partial work |
-| Budget is zero | Systems 1+2+3 | **2. Execution + Planning** — Beads is free + git-backed. Or **3a** (simple script) |
+| Multiple agent providers | Systems 1-4 | **3. Full Stack** — feedback controller dispatches to any CLI agent |
+| Crash recovery is critical | Systems 1-4 | **3. Full Stack** — feedback controller with timeout + re-dispatch |
+| Long-running, multi-step workflows | Systems 1-4 | **3. Full Stack** — feedback controller for dispatch-evaluate-adjust loop |
+| Production systems (CI/CD, deployments) | Systems 1-5 | **3. Full Stack** — feedback controller; consider Temporal for fixed deterministic pipelines |
+| Budget is zero | Systems 1+2+3 | **2. Execution + Planning** — Beads is free + git-backed. Or **3** (feedback controller is just a script) |
 | Committed to Claude Code only | Systems 1+2 | **1. Execution Only** — with discovery tool. Understand the coupling cost |
 
 ---
@@ -172,9 +172,9 @@ See `temporal-analysis.md` for the full Temporal analysis.
 
 **Why this matters**: Persistent cross-project tasks accumulate compounding value. Discovered issues, dependency insights, and workflow patterns compound across sessions instead of evaporating. Agents are more effective when they know what was done before. The gap is real and the pain grows with the number of projects and sessions.
 
-**Why it might not**: Claude Code is actively evolving — multi-project awareness and cross-session resume are natural next steps that may arrive natively. For solo developers on one project with short sessions, the built-in tasks are already sufficient. Every tool in your workflow consumes attention; if your bottleneck is elsewhere (context limits, code quality, test coverage), task management infrastructure may not be the highest-leverage investment. Temporal's infrastructure cost and learning curve are only justified when losing progress is genuinely expensive.
+**Why it might not**: Claude Code is actively evolving — multi-project awareness and cross-session resume are natural next steps that may arrive natively. For solo developers on one project with short sessions, the built-in tasks are already sufficient. Every tool in your workflow consumes attention; if your bottleneck is elsewhere (context limits, code quality, test coverage), task management infrastructure may not be the highest-leverage investment.
 
-**The organizing principle**: Orchestration belongs in your own deterministic system; agents are workers that receive tasks and return results. Claude Code's task system is a useful within-session convenience — let agents use it for self-organization. But your source of truth for "what needs doing" should be vendor-independent and deterministic. And you — the human — are System 5. No tool replaces your governance function: defining what the system is, what it may do, and when to restructure it.
+**The organizing principle**: The orchestrator is a feedback controller that iteratively converges on the right result. Dispatch, evaluate, adjust, re-dispatch. Single-loop corrects execution errors; double-loop questions whether the approach is right. This is simpler and cheaper than workflow replay infrastructure, and it matches how agent work actually proceeds — you don't reproduce identical steps, you retry with better information. Claude Code's task system is a useful within-session convenience — let agents use it for self-organization. But the orchestration loop itself should be deterministic, vendor-independent, and yours. And you — the human — are System 5. You define what the system is, what it may do, and when to restructure it.
 
 ---
 

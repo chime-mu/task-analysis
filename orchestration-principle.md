@@ -62,6 +62,8 @@ These are not edge cases -- they are inherent properties of probabilistic system
 
 It decides what to do next. It tracks progress. It handles retries. It recovers from crashes. It runs tests. It commits code. It knows what was done and what remains.
 
+The orchestrator is not just deterministic — it is a feedback controller. It dispatches a task, evaluates the result against the goal, and adjusts. Single-loop: the task failed, retry it. Double-loop: the task failed repeatedly, so the approach is wrong — reframe the task, change the agent, revise the decomposition, re-dispatch. This is Ashby's ultrastability applied to task orchestration: first-order correction within the existing frame, second-order restructuring when the frame itself is inadequate. The process is iterative convergence — approaching the right result through successive corrections, not replaying a fixed sequence of steps.
+
 ### Agents are workers.
 
 They receive well-scoped tasks. They do the thinking-heavy work: code generation, debugging, analysis, creative problem-solving. They return results. They do not decide the workflow.
