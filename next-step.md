@@ -2,6 +2,8 @@
 
 **[REVISED 2026-02-08]**: Updated with new findings about session-scoped UUIDs (`bR()` fallback), the distinction between file persistence and practical persistence, `--resume` / `--continue` / `CLAUDE_CODE_TASK_LIST_ID` as partial mitigations, and crash fragility as an observed failure mode. Further revised to add strategic risk analysis (vendor coupling, internal API fragility, deterministic orchestration principle) and reframe recommendations. See `orchestration-principle.md`.
 
+**[REVISED 2026-02-08, Temporal update]**: Added Temporal (temporal.io) as a concrete implementation of Approach D. Approach D split into D1 (simple script orchestrator) and D2 (Temporal). Recommendations, effort estimates, and decision matrix updated. See `temporal-analysis.md` and `task-system-comparison.md`.
+
 ## The Question
 
 > If I wanted Beads-like multi-project task management today, working primarily with Claude Code, what should I do?
@@ -91,6 +93,8 @@ Claude Code is one agent platform. Codex, Gemini CLI, open-source agent framewor
 Agents excel at reasoning and code generation. They are unreliable for deterministic workflows: running test suites, committing to git, deciding what to work on next, tracking progress across sessions. They forget instructions, skip steps, and hallucinate workflow states. Traditional software is simply better at predictable execution.
 
 **The strategic response**: Orchestration belongs in your own deterministic system. Agents are workers that receive tasks and return results. Agent-internal task systems are within-session conveniences, not foundations to build on. See `orchestration-principle.md` for the full argument.
+
+**Temporal addresses all three risks.** It is vendor-independent (agents are Activities that invoke CLI commands -- switching providers means changing a command). It is not coupled to any agent's internals (state lives in Temporal's event history, not in `~/.claude/`). And it replaces agent-driven orchestration with deterministic Workflow code that cannot forget instructions or skip steps. See `temporal-analysis.md` for the full analysis.
 
 ---
 
@@ -207,7 +211,13 @@ in_progress status (likely from a previous crash) and reset them to pending.
 
 **What**: Build or adopt a deterministic orchestration system that owns the workflow. Agents are workers that receive tasks and return results. The orchestrator handles progress tracking, crash recovery, retries, and "what next" logic through traditional software.
 
-**Principle** (abstract, no specific implementation prescribed):
+This approach has two concrete implementations:
+
+#### Approach D1: Simple Script Orchestrator
+
+**What**: A lightweight script (shell, Python, etc.) that reads a task file (YAML, JSON, or TOML), dispatches work to agents via CLI, and tracks completion state.
+
+**Principle**:
 - The orchestrator maintains its own task state (in files, SQLite, a database -- whatever suits your needs). Not in `~/.claude/`.
 - It dispatches work to agents via their CLI interfaces (`claude`, `codex`, etc.). Switching agents = changing a command.
 - It handles deterministic operations itself: running test suites, committing to git, checking CI status.
@@ -216,24 +226,75 @@ in_progress status (likely from a previous crash) and reset them to pending.
 
 **What agent-internal tasks become**: A helpful within-session feature. The agent can use TaskCreate to break down a complex coding task into subtasks. But the *outer loop* -- what the agent should be working on, what's been done, what failed -- is owned by the orchestrator.
 
-**Effort**: Varies by implementation ambition. A simple shell-script orchestrator that reads a YAML task file and dispatches to `claude` CLI: ~2-3 days. A full workflow engine: weeks.
+**Effort**: ~2-3 days for a basic version.
 
 **Tradeoffs**:
 - (+) Vendor-independent -- works with any agent that has a CLI
 - (+) Crash-resilient -- orchestrator state is not tied to agent session
 - (+) Deterministic -- traditional software doesn't forget instructions
 - (+) Future-proof -- survives Claude Code internal changes, pricing changes, provider switches
-- (-) Requires building or adopting your own system
-- (-) More upfront design work than using an agent's built-in tasks
+- (+) Minimal infrastructure -- runs as a local script, no server needed
+- (-) You must build it yourself -- no off-the-shelf solution
+- (-) Limited crash recovery -- the script can re-dispatch, but has no replay of partial work
+- (-) No built-in retry policies, timeouts, or activity-level recovery
 - (-) You lose the zero-setup convenience of Claude Code's built-in task system as a cross-session mechanism (but as documented, that mechanism is effectively broken anyway)
+
+#### Approach D2: Temporal (Production Durable Execution)
+
+**What**: Use Temporal (temporal.io) as the orchestration layer. Temporal is a durable execution platform that guarantees Workflows run to completion through crash recovery, deterministic replay, and automatic retry. OpenAI Codex and Replit Agent 3 run on it in production.
+
+**How it works**:
+- **Workflows** are deterministic functions that define the overall process (e.g., "fetch issue, generate code, run tests, create PR")
+- **Activities** are non-deterministic functions where side effects happen -- including invoking AI agents via CLI (`claude --print`, `codex --quiet`, etc.)
+- **Workers** are processes you run that poll for work and execute your code
+- **Event History** records every step; if a Worker crashes, another Worker replays from history, skipping completed Activities
+
+**Concrete example**:
+```python
+@workflow.defn
+class FixBugWorkflow:
+    @workflow.run
+    async def run(self, bug_description: str, repo_path: str):
+        # Activity 1: Agent generates fix (retried automatically on crash)
+        fix = await workflow.execute_activity(
+            run_claude_agent, bug_description, repo_path,
+            retry_policy=RetryPolicy(maximum_attempts=3)
+        )
+        # Activity 2: Deterministic test run
+        await workflow.execute_activity(run_tests, repo_path)
+        # Activity 3: Create PR
+        await workflow.execute_activity(create_pr, repo_path)
+```
+
+If the Worker crashes after Activity 1, a new Worker replays the Workflow, sees Activity 1 already completed in the event history, skips it, and retries Activity 2. No work is lost.
+
+**Effort**: ~1 week for setup + initial Workflows. Development server: 5 minutes (`temporal server start-dev`). Production: 1-2 days for infrastructure (Docker Compose or Temporal Cloud at ~$100/month).
+
+**Tradeoffs**:
+- (+) **Concrete implementation of the orchestration principle** -- not abstract, production-proven at OpenAI/Replit scale
+- (+) Vendor-independent -- agents are Activities; switching providers = changing a CLI command
+- (+) Automatic crash recovery with partial-work preservation (completed Activities cached in event history)
+- (+) Built-in retry policies, timeouts, heartbeats, and configurable backoff
+- (+) Multi-agent routing via Task Queues (Claude for reasoning, Codex for boilerplate)
+- (+) Human-in-the-loop via Signals (wait for approval before deploying)
+- (+) Complete auditability -- every step recorded with timestamps and payloads
+- (+) Cross-machine coordination native (Workers can run anywhere)
+- (+) Polyglot SDKs (Python, Go, TypeScript, Java, .NET)
+- (-) **Infrastructure cost** -- requires a server (self-hosted or Cloud at ~$100/month+)
+- (-) **Steep learning curve** -- determinism constraints, event sourcing model, Workflow versioning
+- (-) **Overkill for simple cases** -- a solo developer with short sessions does not need durable execution
+- (-) **Event history limit** -- ~51K events per execution; long-running Workflows need Continue-As-New
+- (-) More upfront investment than D1's shell script approach
+
+See `temporal-analysis.md` for the full analysis.
 
 ---
 
 ## Revised Recommendation
 
-**Start with Approach C (Hybrid), but with less urgency than originally suggested.**
+**The strategic answer is now concrete: the orchestration principle has a production-proven implementation.**
 
-Here is why the calculus has changed:
+Previous revisions of this document recommended Approach D in the abstract -- "build or adopt a deterministic orchestration system." This left the reader to figure out what that means in practice. Temporal makes Approach D concrete. OpenAI Codex and Replit Agent 3 already run on it. The question is no longer "should you have a deterministic orchestrator?" but "which level of orchestrator matches your needs?"
 
 ### What changed from the original analysis:
 
@@ -244,6 +305,8 @@ Here is why the calculus has changed:
 3. **[REVISED] Approach B is NOT obsolete -- it needs to build discoverability, not file persistence.** The original Approach B was "build a lightweight persistence layer for Claude Code Tasks." File persistence already exists, so that specific work is unnecessary. But the real missing piece -- task discoverability across sessions -- is a concrete, buildable tool. A discovery script that maps sessions to tasks and generates the correct `--resume` + `CLAUDE_CODE_TASK_LIST_ID` command would provide genuine value. See revised Approach B below.
 
 4. **[REVISED] Building on agent internals is strategically risky.** The previous revision recommended a `claude-tasks` discovery tool as "critical" mitigation. This deepens coupling to Claude Code's undocumented internals. A strategically sound approach treats agent task systems as within-session conveniences and puts orchestration in your own vendor-independent system. See `orchestration-principle.md`.
+
+5. **[NEW] Temporal makes Approach D concrete.** The orchestration principle is no longer abstract. Temporal is a production-proven durable execution platform that implements every aspect: deterministic Workflows, agents as Activities, automatic crash recovery, vendor-independent dispatch. The tradeoff is infrastructure cost and learning curve. See `temporal-analysis.md`.
 
 ### What stayed the same:
 
@@ -261,7 +324,13 @@ Here is why the calculus has changed:
 
 3. **If you want cross-session continuity on a single project**: The `--resume <sessionId>` flag + `CLAUDE_CODE_TASK_LIST_ID` env var makes this viable without Beads. Build the discovery tool (Approach B, ~1-2 days) to make resume practical instead of requiring manual UUID tracking.
 
-4. **If you want to wait**: Claude Code's task infrastructure is actively being built out, but **waiting carries real risk without at minimum the discovery tool**. A single crash can leave valuable task state orphaned. The discovery tool (Approach B) is a ~1-2 day investment that provides immediate insurance against this failure mode.
+4. **If crash recovery matters**: Use Temporal (Approach D2). A simple orchestrator script (D1) can re-dispatch failed tasks, but only Temporal preserves partial work -- completed Activities are cached in the event history and never re-executed on retry. The infrastructure cost (~$100/month for Cloud, or self-hosted Docker Compose) is justified when losing progress is more expensive than the subscription.
+
+5. **If infrastructure cost is too high**: Use Approach D1 (simple script orchestrator). It provides vendor independence and basic crash re-dispatch without requiring a server. Combine with Beads for the planning layer.
+
+6. **If you want the full stack**: Temporal (orchestration) + Beads (planning) + Claude Code Tasks (execution). This is three layers, not three competing systems. Temporal guarantees completion, Beads tracks the backlog, Claude does the work. See `task-system-comparison.md` for the architectural layer diagram.
+
+7. **If you want to wait**: Claude Code's task infrastructure is actively being built out, but **waiting carries real risk without at minimum the discovery tool**. A single crash can leave valuable task state orphaned. The discovery tool (Approach B) is a ~1-2 day investment that provides immediate insurance against this failure mode.
 
 ---
 
@@ -307,7 +376,8 @@ Note: Several items from the original estimate are now marked as "already exists
 | Auto-unassign on shutdown | -- | **Already exists** | -- |
 | Background task system | -- | **Already exists** | -- |
 | Task discoverability tool (`claude-tasks`) | 1-2 days | New | Tactical |
-| **Vendor-independent orchestrator** (Approach D) | **2-3 days** (simple) | **New** | **Strategic** |
+| **Simple script orchestrator** (Approach D1) | **2-3 days** | **New** | **Strategic** |
+| **Temporal setup + initial Workflows** (Approach D2) | **~1 week** | **New** | **Strategic** |
 | Project-scoped task lists | 1-2 days | New | High |
 | Cross-session resume | 1 day | New | High |
 | Multi-project registry | 1-2 days | New | Medium |
@@ -319,11 +389,12 @@ Note: Several items from the original estimate are now marked as "already exists
 | Compaction | 2-3 days | New | Low |
 | Content hashing | 1 day | New | Low |
 
-**Total for strategic item** (vendor-independent orchestrator): ~2-3 days (simple version)
-**Total for must-haves** (orchestrator + project registry + resume + ready): ~6-8 days
-**Total for everything new**: ~18-27 days
+**Approach D1** (simple orchestrator): ~2-3 days. Vendor-independent, basic crash re-dispatch, no infrastructure cost.
+**Approach D2** (Temporal): ~1 week setup + ongoing infrastructure (~$100/month Cloud or self-hosted). Automatic crash recovery with partial-work preservation, multi-agent routing, complete auditability.
+**Total for must-haves** (D1 or D2 + project registry + resume + ready): ~6-10 days
+**Total for everything new**: ~20-30 days
 
-This is a significant revision from the original estimate. The discovery tool is demoted from "critical" to "tactical" -- it addresses the session-scoped UUID problem but deepens coupling to Claude Code internals. The strategic recommendation is a vendor-independent orchestrator (Approach D).
+The strategic recommendation is Approach D (either D1 or D2, depending on crash recovery requirements). D1 is cheaper and simpler. D2 (Temporal) provides stronger guarantees -- choose it when losing progress is more expensive than the infrastructure cost.
 
 ---
 
@@ -342,6 +413,10 @@ This is a significant revision from the original estimate. The discovery tool is
 5. **Beads exists as an option**: For the multi-project and cross-machine dimensions, Beads is a working implementation. The hybrid approach requires minimal custom code.
 
 6. **Progressive adoption**: Start by using Claude Code's existing Tasks system as-is. Add Beads for multi-project visibility only if you need it. The investment scales with the need.
+
+7. **[NEW] Temporal makes Approach D concrete, not abstract.** The previous version of this document recommended "build or adopt a deterministic orchestrator" without naming a specific system. Temporal is that system -- production-proven at OpenAI and Replit scale. It provides crash recovery, deterministic replay, vendor-independent agent dispatch, and complete auditability. The strategic recommendation is no longer hypothetical.
+
+8. **[NEW] Production precedent exists.** OpenAI Codex runs agent execution on Temporal. Replit Agent 3 uses Temporal for agentic workflows. The OpenAI Agents SDK integrates with Temporal. These are not experiments -- they are production systems serving millions of users. The architectural pattern is validated.
 
 ### Cons (Not Worth It / Wait)
 
@@ -367,17 +442,25 @@ This is a significant revision from the original estimate. The discovery tool is
 
 11. **Agents are unreliable orchestrators.** Deciding what to do next, tracking progress, running tests, committing code -- these are deterministic operations. Agents forget instructions, skip steps, and hallucinate workflow states. Traditional software is simply better for this.
 
+12. **[NEW] Temporal's infrastructure cost may not be justified.** Temporal Cloud starts at ~$100/month. Self-hosting requires a server, database, and operational attention. For a solo developer running short sessions, this is overkill. The crash recovery and deterministic replay that justify Temporal's complexity only matter when losing progress is genuinely expensive.
+
+13. **[NEW] Temporal's learning curve is steep.** Determinism constraints (no `time.now()`, no `random()`, no non-deterministic library calls in Workflows), event sourcing, Workflow versioning, and Activity design require significant conceptual investment. Estimate 1-2 days for basic usage, 1-2 weeks for production confidence.
+
+14. **[NEW] Temporal is overkill for simple orchestration.** If your "workflow" is "read a task list, invoke `claude --print`, check the result," a shell script (Approach D1) is simpler, cheaper, and faster to build. Temporal's value proposition -- crash recovery with partial-work preservation, multi-agent routing, Signals for human-in-the-loop -- only materializes for complex, long-running, multi-step workflows.
+
 ---
 
 ## Verdict (Revised)
 
 **For everyone**: Adopt the principle that orchestration belongs in your own system, not in agent internals. Claude Code's task system is a useful within-session convenience -- let agents use it for self-organization. But your source of truth for "what needs doing" should be vendor-independent and deterministic. See `orchestration-principle.md`.
 
-**For solo developers on one project**: If sessions are short and self-contained, Claude Code's built-in tasks are fine as-is. No external tooling needed. If work spans sessions, put your task list in a file *in your repo* (a TODO.md, a YAML plan file, whatever) that any agent or human can read.
+**For solo developers on one project**: If sessions are short and self-contained, Claude Code's built-in tasks are fine as-is. No external tooling needed. If work spans sessions, put your task list in a file *in your repo* (a TODO.md, a YAML plan file, whatever) that any agent or human can read. Temporal is overkill here.
 
-**For developers managing multiple projects**: Build or adopt a simple orchestrator that reads your task definitions and dispatches to agents. This is Approach D. The discovery tool (Approach B) is a tactical option if you're committed to Claude Code, but understand the coupling cost.
+**For developers managing multiple projects**: Build or adopt an orchestrator. Approach D1 (simple script) for basic needs. Approach D2 (Temporal) if crash recovery matters or you dispatch to multiple agent providers. Beads (Approach A/C) for the planning layer regardless. The discovery tool (Approach B) is a tactical option if you're committed to Claude Code, but understand the coupling cost.
 
-**For teams with multiple agents across machines**: You need a real orchestration system. Beads (Approach A) is one option. A custom system is another. The key requirement is that it be independent of any single agent's internals.
+**For teams with multiple agents across machines**: Temporal (Approach D2) is the strongest option -- it provides crash recovery, multi-agent routing via Task Queues, and vendor-independent dispatch. Beads (Approach A) handles the planning layer (persistent backlog, multi-project views). Claude Code Tasks handles the execution layer (in-session agent coordination). This is the full three-layer stack described in `task-system-comparison.md`.
+
+**For production systems (CI/CD, deployment pipelines, batch processing)**: Temporal is the clear recommendation. These systems need guaranteed completion, auditability, and deterministic behavior. Agent crashes must not lose progress. A shell script orchestrator (D1) is insufficient for this use case.
 
 **On the discovery tool**: The `claude-tasks` script (Approach B) is still a valid tactical choice if you accept the coupling to Claude Code internals. It's useful, it's fast to build, and it solves a real immediate problem. But it is not the strategic recommendation. Prefer Approach D for long-term investment.
 
@@ -389,7 +472,15 @@ This is a significant revision from the original estimate. The discovery tool is
 |---|---|
 | Any developer using AI agents | Adopt the orchestration principle: your system owns the workflow, agents are workers |
 | 1 project, short sessions | Claude Code's built-in tasks are fine. Keep a task list in your repo as fallback. |
-| 1 project, cross-session work | Approach D (simple orchestrator) or task list in repo. Approach B if committed to Claude. |
-| 2-3 projects | Approach D. Beads (Approach A) if you want a ready-made solution. |
-| Multiple agents across machines | Approach A (Beads) or Approach D with git-backed state. |
+| 1 project, cross-session work | Approach D1 (simple orchestrator) or task list in repo. Approach B if committed to Claude. |
+| 2-3 projects | Approach D1 + Beads (Approach C). Temporal (D2) if crash recovery needed. |
+| Multiple agents across machines | Temporal (Approach D2) + Beads (Approach C) for full stack. |
+| Multiple agent providers (Claude + Codex + open source) | Temporal (Approach D2) -- Activities wrap any CLI agent. |
+| Production system (CI/CD, deployments) | Temporal (Approach D2) -- guaranteed completion, auditability, automatic retry. |
+| Crash recovery is critical | Temporal (Approach D2) -- only option with automatic partial-work recovery. |
+| Budget is zero | Approach D1 (script) + Beads (free, git-backed). |
 | Committed to Claude Code only | Approach B (discovery tool) as tactical mitigation. Understand the coupling cost. |
+
+---
+
+*This document is part of the task-analysis project. See `temporal-analysis.md` for the Temporal deep-dive, `task-system-comparison.md` for the 3-way comparison, `orchestration-principle.md` for the underlying principle, and `beads-task-system.md` for the Beads deep-dive.*
