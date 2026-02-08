@@ -1,5 +1,7 @@
 # Next Step: Extending Claude Code Tasks Toward Multi-Project Management
 
+**[REVISED 2026-02-08]**: Updated with new findings about session-scoped UUIDs (`bR()` fallback), the distinction between file persistence and practical persistence, `--resume` / `--continue` / `CLAUDE_CODE_TASK_LIST_ID` as partial mitigations, and crash fragility as an observed failure mode. Further revised to add strategic risk analysis (vendor coupling, internal API fragility, deterministic orchestration principle) and reframe recommendations. See `orchestration-principle.md`.
+
 ## The Question
 
 > If I wanted Beads-like multi-project task management today, working primarily with Claude Code, what should I do?
@@ -55,7 +57,9 @@ Given what Claude Code already has, the gap is narrower than initially assumed b
 
 | Capability | Status | Gap Size |
 |-----------|--------|----------|
-| Task persistence | **Already exists** (swarm mode) | None |
+| File persistence | **Already exists** (JSON files on disk) | None |
+| Task discoverability / practical persistence | Does not exist -- session-scoped UUIDs, no discovery tool | **Large** |
+| Crash recovery | Does not exist -- tasks stuck in `in_progress` permanently | **Large** |
 | Multi-agent coordination | **Already exists** (file locking, claiming, busy checks) | None for same-machine |
 | Dependency tracking | **Already exists** (blocks/blockedBy, enforced at claim) | Small (lacks rich types) |
 | Auto-incrementing IDs with highwatermark | **Already exists** | None |
@@ -66,7 +70,27 @@ Given what Claude Code already has, the gap is narrower than initially assumed b
 | Compaction | Does not exist | **Medium** |
 | Cross-machine agent coordination | Does not exist | **Medium** |
 
-The gap is not about basic infrastructure (persistence, locking, ownership, dependencies) -- Claude Code already has all of that. The gap is about **scope** (multi-project), **workflow** (templates, ready computation), and **distribution** (git, cross-machine).
+**[REVISED]** The gap has two layers. **Within-session infrastructure is solid**: persistence, locking, ownership, dependencies, multi-agent coordination all work well. But **cross-session continuity is fundamentally broken**: task lists are scoped to random UUIDs (`bR()` generates a UUIDv7 per session), making tasks undiscoverable after the session ends. The `--resume <sessionId>` CLI flag and `CLAUDE_CODE_TASK_LIST_ID` env var provide manual recovery paths, but require knowing the session UUID -- which is not exposed in any user-facing interface. The gap is about **discoverability** (finding previous tasks), **scope** (multi-project), **workflow** (templates, ready computation), and **distribution** (git, cross-machine).
+
+---
+
+## Strategic Risks of Building on Agent Internals
+
+Before evaluating approaches, it is worth stepping back to consider the strategic risks of building tooling on top of any agent's internal task system.
+
+### 1. Internal API Fragility
+
+`~/.claude/tasks/`, `sessions-index.json`, and `CLAUDE_CODE_TASK_LIST_ID` are undocumented implementation details. Anthropic has not exposed tasks as an external interface -- no `claude tasks list` CLI command, no public API, no documented schema. This signals intent to maintain freedom to change these internals. A tool built on them today may break silently with any update.
+
+### 2. Vendor Lock-in
+
+Claude Code is one agent platform. Codex, Gemini CLI, open-source agent frameworks each have their own (or no) task systems. Orchestration logic coupled to Claude Code's internals is non-portable. If a better tool emerges or pricing changes, you start over.
+
+### 3. Agents Are Unreliable Orchestrators
+
+Agents excel at reasoning and code generation. They are unreliable for deterministic workflows: running test suites, committing to git, deciding what to work on next, tracking progress across sessions. They forget instructions, skip steps, and hallucinate workflow states. Traditional software is simply better at predictable execution.
+
+**The strategic response**: Orchestration belongs in your own deterministic system. Agents are workers that receive tasks and return results. Agent-internal task systems are within-session conveniences, not foundations to build on. See `orchestration-principle.md` for the full argument.
 
 ---
 
@@ -95,18 +119,32 @@ The gap is not about basic infrastructure (persistence, locking, ownership, depe
 - (-) Two task systems running simultaneously -- but this is less problematic now since Claude Code's Tasks system already handles in-session coordination well, and Beads handles the cross-session/cross-project layer
 - (-) Beads is a young project -- API and concepts may evolve
 
-### Approach B: Build a Thin Multi-Project Layer on Top of Claude Code's Existing Tasks
+### Approach B: Tactical Discovery Tool (Claude Code-Specific)
 
-**What**: Since Claude Code already has persistence, locking, dependencies, and coordination, build only the missing pieces: multi-project awareness, cross-session resume, and ready computation.
+> **Caveat**: This tool builds directly on Claude Code's undocumented internals (`~/.claude/tasks/`, `sessions-index.json`). It is a tactical band-aid, not a strategic solution. It solves a real immediate problem but deepens vendor coupling. See "Strategic Risks" above and `orchestration-principle.md`.
 
-**Implementation sketch**:
+**What**: Since Claude Code already has file persistence, locking, dependencies, and coordination, build a missing piece: **task discoverability** -- the ability to find, inspect, and resume previous sessions' tasks.
 
-Claude Code's task files already live at `~/.claude/tasks/{team-name}/`. The key insight is that the team name is configurable -- you can set `CLAUDE_CODE_TASK_LIST_ID` to any value, or use different team names per project. The missing pieces are:
+**Implementation sketch -- a `claude-tasks` shell script**:
 
-1. **Project registry**: A `~/.claude/projects.json` mapping project names to directories and their corresponding task list IDs
-2. **Ready computation script**: A shell script or Claude Code hook that scans all registered task list directories, reads the JSON files, filters for unblocked pending tasks, and presents them
-3. **Session resume instructions**: CLAUDE.md instructions that tell the agent to check the project's task list at session start using `TaskList`
-4. **Cross-project dependency convention**: Use the `metadata` field to store cross-project references (e.g., `metadata: { "cross_dep": "other-project:3" }`)
+The data sources already exist. `~/.claude/projects/*/sessions-index.json` records session metadata (session ID, project path, git branch, first prompt, summary, timestamps) for all known sessions. `~/.claude/tasks/*/` contains the actual task files. The script connects these:
+
+1. **Scan** `~/.claude/projects/*/sessions-index.json` for all known sessions across all projects
+2. **Cross-reference** against `~/.claude/tasks/*/` directories -- match session IDs to task list UUIDs
+3. **Read task JSON files** to find non-empty task lists with `pending` or `in_progress` work
+4. **Display** actionable information:
+   - Project path and git branch
+   - Session date and first prompt (from sessions-index)
+   - Task count, task subjects, statuses, and dependency DAG
+   - Whether tasks are stuck (e.g., `in_progress` from a crashed session)
+5. **Generate the resume command**: `CLAUDE_CODE_TASK_LIST_ID=<uuid> claude --resume <sessionId>`
+
+**Companion CLAUDE.md instruction**:
+```
+When CLAUDE_CODE_TASK_LIST_ID is set, call TaskList at the start of the session
+to review existing tasks before creating new ones. Check for tasks stuck in
+in_progress status (likely from a previous crash) and reset them to pending.
+```
 
 **What you do NOT need to build** (because Claude Code already has it):
 - Task persistence (already JSON files on disk)
@@ -115,19 +153,25 @@ Claude Code's task files already live at `~/.claude/tasks/{team-name}/`. The key
 - Dependency enforcement (already checked at claim time)
 - Agent coordination (already team system with auto-unassign)
 
-**Effort**: Low. ~1 day of scripting. A `projects.json` file, a `ready.sh` script, and CLAUDE.md instructions.
+**Effort**: Low. ~1-2 days. The tool is straightforward shell scripting; the data sources exist and are human-readable JSON.
 
 **Tradeoffs**:
 - (+) Builds on existing Claude Code infrastructure -- no external binary
-- (+) Minimal new code since the hard parts (persistence, locking, coordination) already exist
-- (+) Stays within the Claude Code ecosystem
+- (+) Solves the critical discoverability gap directly
+- (+) Generates ready-to-use resume commands
+- (+) Can detect crashed/stuck tasks
 - (+) Task files are already human-readable JSON
+- (+) Stays within the Claude Code ecosystem
 - (-) No git distribution -- still local filesystem only
 - (-) No daemon, no background sync
 - (-) No compaction
 - (-) No workflow templates or gate steps
-- (-) The ready computation is a separate script, not integrated into the agent loop
+- (-) The discovery is a separate script, not integrated into the agent loop
 - (-) Cross-project dependencies via metadata are a convention, not enforced
+- (-) Relies on `sessions-index.json` existing and being populated (it is for interactive sessions)
+- (-) **Couples to undocumented internals** -- `~/.claude/tasks/` path, JSON format, and `sessions-index.json` structure are all implementation details that can change without notice
+- (-) **Vendor lock-in** -- entirely Claude Code-specific; useless if you switch to Codex or open-source agents
+- (-) **Doesn't solve the fundamental problem** -- orchestration decisions still depend on an agent's internal state rather than your own system
 
 ### Approach C: Hybrid -- Beads for Multi-Project Planning, Claude Code for Execution
 
@@ -153,9 +197,35 @@ Claude Code's task files already live at `~/.claude/tasks/{team-name}/`. The key
 - (+) Minimal custom code
 - (+) Each system does what it is best at
 - (+) Can progressively adopt Beads features (molecules, formulas) as needed
+- (+) `--resume` + `CLAUDE_CODE_TASK_LIST_ID` makes the hybrid more viable than previously thought -- in-session subtask state can be reconnected
 - (-) Two systems to understand (but they operate at different layers)
 - (-) Relies on agent following CLAUDE.md instructions correctly
 - (-) Beads is still an external dependency
+- (-) In-session subtask state (Claude Code's Tasks) is still lost on crash even when Beads handles the outer layer -- only Beads issues have crash resilience
+
+### Approach D: Vendor-Independent Deterministic Orchestration
+
+**What**: Build or adopt a deterministic orchestration system that owns the workflow. Agents are workers that receive tasks and return results. The orchestrator handles progress tracking, crash recovery, retries, and "what next" logic through traditional software.
+
+**Principle** (abstract, no specific implementation prescribed):
+- The orchestrator maintains its own task state (in files, SQLite, a database -- whatever suits your needs). Not in `~/.claude/`.
+- It dispatches work to agents via their CLI interfaces (`claude`, `codex`, etc.). Switching agents = changing a command.
+- It handles deterministic operations itself: running test suites, committing to git, checking CI status.
+- If an agent crashes mid-task, the orchestrator knows what was in progress and re-dispatches.
+- Claude Code's internal TaskCreate/TaskList are fine for the agent's self-organization within a session. They're a convenience, not the source of truth.
+
+**What agent-internal tasks become**: A helpful within-session feature. The agent can use TaskCreate to break down a complex coding task into subtasks. But the *outer loop* -- what the agent should be working on, what's been done, what failed -- is owned by the orchestrator.
+
+**Effort**: Varies by implementation ambition. A simple shell-script orchestrator that reads a YAML task file and dispatches to `claude` CLI: ~2-3 days. A full workflow engine: weeks.
+
+**Tradeoffs**:
+- (+) Vendor-independent -- works with any agent that has a CLI
+- (+) Crash-resilient -- orchestrator state is not tied to agent session
+- (+) Deterministic -- traditional software doesn't forget instructions
+- (+) Future-proof -- survives Claude Code internal changes, pricing changes, provider switches
+- (-) Requires building or adopting your own system
+- (-) More upfront design work than using an agent's built-in tasks
+- (-) You lose the zero-setup convenience of Claude Code's built-in task system as a cross-session mechanism (but as documented, that mechanism is effectively broken anyway)
 
 ---
 
@@ -167,11 +237,13 @@ Here is why the calculus has changed:
 
 ### What changed from the original analysis:
 
-1. **Claude Code is not ephemeral** (in swarm mode). The original recommendation was partly driven by the belief that Claude Code tasks vanish on session end. They do not -- they persist as JSON files. This means the "persistence gap" is smaller than assumed.
+1. **[REVISED] Claude Code is not ephemeral but IS fragile.** Task files persist as JSON on disk, so the "persistence gap" at the file level is smaller than originally assumed. However, file persistence != practical persistence. Task lists are scoped to random session UUIDs (`bR()` fallback), making them undiscoverable after the session ends. The `--resume <sessionId>` flag and `CLAUDE_CODE_TASK_LIST_ID` env var provide partial recovery paths, but require manually tracking UUIDs that are not exposed in any user-facing interface. Crash fragility is a real, observed failure mode.
 
 2. **Claude Code already has multi-agent coordination**. The original analysis positioned this as a major Beads advantage. Claude Code actually has file-locking, atomic claiming, agent busy checks, and auto-unassign -- a robust same-machine coordination system. The advantage Beads has is specifically cross-machine coordination.
 
-3. **The "build persistence" approach (old Approach B) is obsolete**. The original Approach B was "build a lightweight persistence layer for Claude Code Tasks." This is unnecessary -- Claude Code already has persistence. The real missing piece is multi-project awareness and cross-session workflow, which is a thinner layer than previously estimated.
+3. **[REVISED] Approach B is NOT obsolete -- it needs to build discoverability, not file persistence.** The original Approach B was "build a lightweight persistence layer for Claude Code Tasks." File persistence already exists, so that specific work is unnecessary. But the real missing piece -- task discoverability across sessions -- is a concrete, buildable tool. A discovery script that maps sessions to tasks and generates the correct `--resume` + `CLAUDE_CODE_TASK_LIST_ID` command would provide genuine value. See revised Approach B below.
+
+4. **[REVISED] Building on agent internals is strategically risky.** The previous revision recommended a `claude-tasks` discovery tool as "critical" mitigation. This deepens coupling to Claude Code's undocumented internals. A strategically sound approach treats agent task systems as within-session conveniences and puts orchestration in your own vendor-independent system. See `orchestration-principle.md`.
 
 ### What stayed the same:
 
@@ -185,11 +257,11 @@ Here is why the calculus has changed:
 
 1. **If you need multi-project management today**: Install Beads, use Approach C. The hybrid works naturally because the systems layer (Beads = planning, Claude Code = execution).
 
-2. **If you primarily work on one project with multiple agents**: You may not need Beads at all. Claude Code's swarm-mode Tasks already provide persistence, coordination, and dependency enforcement. Just use it as-is.
+2. **If you primarily work on one project with multiple agents**: Claude Code's swarm-mode Tasks already provide file persistence, coordination, and dependency enforcement. **However**, be aware of crash fragility: if a session crashes, tasks are stuck. Consider recording session UUIDs (visible in `~/.claude/projects/*/sessions-index.json`) or building the discovery tool (Approach B) as a safety net.
 
-3. **If you want cross-session continuity on a single project**: Consider Approach B -- a thin script that reads `~/.claude/tasks/{team}/` files and computes ready work. This is a ~1 day effort and does not require Beads.
+3. **If you want cross-session continuity on a single project**: The `--resume <sessionId>` flag + `CLAUDE_CODE_TASK_LIST_ID` env var makes this viable without Beads. Build the discovery tool (Approach B, ~1-2 days) to make resume practical instead of requiring manual UUID tracking.
 
-4. **If you want to wait**: Claude Code's task infrastructure is actively being built out. The swarm-mode system is new and sophisticated. Multi-project and cross-session features may follow.
+4. **If you want to wait**: Claude Code's task infrastructure is actively being built out, but **waiting carries real risk without at minimum the discovery tool**. A single crash can leave valuable task state orphaned. The discovery tool (Approach B) is a ~1-2 day investment that provides immediate insurance against this failure mode.
 
 ---
 
@@ -225,30 +297,33 @@ Given that Claude Code already has persistence, locking, ownership, dependencies
 
 Note: Several items from the original estimate are now marked as "already exists" since Claude Code already has them.
 
-| Extension | Effort | Status |
-|-----------|--------|--------|
-| Task persistence (file-based) | -- | **Already exists** |
-| File locking for concurrency | -- | **Already exists** |
-| Ownership and claiming | -- | **Already exists** |
-| Dependency enforcement | -- | **Already exists** |
-| Agent busy check | -- | **Already exists** |
-| Auto-unassign on shutdown | -- | **Already exists** |
-| Background task system | -- | **Already exists** |
-| Project-scoped task lists | 1-2 days | New |
-| Cross-session resume | 1 day | New |
-| Multi-project registry | 1-2 days | New |
-| Ready computation | 0.5 day | New (reuses existing dependency logic) |
-| Cross-project dependencies | 2-3 days | New |
-| Git-backed storage | 2-3 days | New |
-| Session handoff | 1-2 days | New |
-| Workflow templates | 3-5 days | New |
-| Compaction | 2-3 days | New |
-| Content hashing | 1 day | New |
+| Extension | Effort | Status | Priority |
+|-----------|--------|--------|----------|
+| Task persistence (file-based) | -- | **Already exists** | -- |
+| File locking for concurrency | -- | **Already exists** | -- |
+| Ownership and claiming | -- | **Already exists** | -- |
+| Dependency enforcement | -- | **Already exists** | -- |
+| Agent busy check | -- | **Already exists** | -- |
+| Auto-unassign on shutdown | -- | **Already exists** | -- |
+| Background task system | -- | **Already exists** | -- |
+| Task discoverability tool (`claude-tasks`) | 1-2 days | New | Tactical |
+| **Vendor-independent orchestrator** (Approach D) | **2-3 days** (simple) | **New** | **Strategic** |
+| Project-scoped task lists | 1-2 days | New | High |
+| Cross-session resume | 1 day | New | High |
+| Multi-project registry | 1-2 days | New | Medium |
+| Ready computation | 0.5 day | New (reuses existing dependency logic) | High |
+| Cross-project dependencies | 2-3 days | New | Low |
+| Git-backed storage | 2-3 days | New | Medium |
+| Session handoff | 1-2 days | New | Medium |
+| Workflow templates | 3-5 days | New | Low |
+| Compaction | 2-3 days | New | Low |
+| Content hashing | 1 day | New | Low |
 
-**Total for must-haves** (project registry, resume, ready, multi-project): ~4-6 days
-**Total for everything new**: ~14-22 days
+**Total for strategic item** (vendor-independent orchestrator): ~2-3 days (simple version)
+**Total for must-haves** (orchestrator + project registry + resume + ready): ~6-8 days
+**Total for everything new**: ~18-27 days
 
-This is a significant revision from the original estimate, which included ~3-5 days for persistence and coordination infrastructure that already exists.
+This is a significant revision from the original estimate. The discovery tool is demoted from "critical" to "tactical" -- it addresses the session-scoped UUID problem but deepens coupling to Claude Code internals. The strategic recommendation is a vendor-independent orchestrator (Approach D).
 
 ---
 
@@ -282,31 +357,39 @@ This is a significant revision from the original estimate, which included ~3-5 d
 
 6. **Complexity budget**: Every tool in your workflow consumes attention. The question is not "would multi-project task management be useful?" (yes, obviously) but "is this the highest-leverage improvement right now?" If your bottleneck is something else (context limits, code quality, test coverage), task management infrastructure may not be the best investment.
 
-7. **The "persistence gap" illusion**: Much of the original motivation for this analysis was the belief that Claude Code tasks are ephemeral. They are not (in swarm mode). This removes the strongest argument for building or adopting an alternative. The remaining gaps (multi-project, ready computation, templates) are real but may not be urgent for most developers.
+7. **[REVISED] File persistence without discoverability is functionally equivalent to ephemerality.** The original version of this point argued that since tasks persist to disk, the gap is smaller than assumed. This is only half right. Tasks persist as files, but they are scoped to random session UUIDs and have no discovery mechanism. For the user, undiscoverable persistence is indistinguishable from no persistence. The `--resume` flag and `CLAUDE_CODE_TASK_LIST_ID` env var provide manual escape hatches, but require the user to proactively record UUIDs before they need them.
+
+8. **Crash fragility is a real, observed failure mode.** Session crashes leave tasks stuck in `in_progress` with no cleanup. This is not a theoretical risk -- it was observed during this analysis. The `--resume` flag provides partial mitigation if the session ID is known, but the default experience after a crash is complete loss of task context.
+
+9. **Internal API coupling risk.** Every tool built on `~/.claude/tasks/` or `sessions-index.json` depends on undocumented internals. Anthropic hasn't exposed tasks as an external interface -- any update can break tooling silently.
+
+10. **Vendor lock-in.** Orchestration logic tied to Claude Code is non-portable. Codex, Gemini CLI, and open-source agent frameworks have different (or no) task systems. Switching providers means starting over.
+
+11. **Agents are unreliable orchestrators.** Deciding what to do next, tracking progress, running tests, committing code -- these are deterministic operations. Agents forget instructions, skip steps, and hallucinate workflow states. Traditional software is simply better for this.
 
 ---
 
 ## Verdict (Revised)
 
-**For solo developers on one project**: You probably do not need anything beyond Claude Code's built-in Tasks system. It already persists to disk, handles agent coordination, and enforces dependencies. Use it as-is.
+**For everyone**: Adopt the principle that orchestration belongs in your own system, not in agent internals. Claude Code's task system is a useful within-session convenience -- let agents use it for self-organization. But your source of truth for "what needs doing" should be vendor-independent and deterministic. See `orchestration-principle.md`.
 
-**For solo developers on 2-3 projects**: The gap that matters is multi-project awareness and cross-session ready computation. Try Approach B first (a thin script that reads task directories and computes ready work). If that is not enough, move to Approach C (add Beads for multi-project planning).
+**For solo developers on one project**: If sessions are short and self-contained, Claude Code's built-in tasks are fine as-is. No external tooling needed. If work spans sessions, put your task list in a file *in your repo* (a TODO.md, a YAML plan file, whatever) that any agent or human can read.
 
-**For developers managing 3+ active projects with AI agents**: Try the hybrid approach (Approach C) for one week. Install Beads in stealth mode, add CLAUDE.md instructions, and see if `bd ready` across projects changes how you start sessions.
+**For developers managing multiple projects**: Build or adopt a simple orchestrator that reads your task definitions and dispatches to agents. This is Approach D. The discovery tool (Approach B) is a tactical option if you're committed to Claude Code, but understand the coupling cost.
 
-**For teams with multiple AI agents across machines**: Beads (or something like it) is close to mandatory. Claude Code's coordination is excellent for same-machine agents, but cross-machine coordination requires git-based or network-based state sharing. Adopt Beads fully (Approach A).
+**For teams with multiple agents across machines**: You need a real orchestration system. Beads (Approach A) is one option. A custom system is another. The key requirement is that it be independent of any single agent's internals.
 
-**For everyone: consider waiting**. Claude Code v2.1.34's swarm-mode Tasks system is new, capable, and clearly under active development. The trajectory suggests Anthropic is building toward richer agent coordination. Features like multi-project awareness, cross-session resume, and ready computation may arrive natively.
+**On the discovery tool**: The `claude-tasks` script (Approach B) is still a valid tactical choice if you accept the coupling to Claude Code internals. It's useful, it's fast to build, and it solves a real immediate problem. But it is not the strategic recommendation. Prefer Approach D for long-term investment.
 
 ---
 
 ## Decision Matrix (Revised)
 
 | Your Situation | Recommendation |
-|---------------|---------------|
-| 1 project, any number of agents | Use Claude Code's built-in Tasks. No extension needed. |
-| 2-3 projects, daily Claude Code use | Try Approach B (thin multi-project script) for a week |
-| 3+ projects, single developer | Try Approach C (Beads hybrid) for a week |
-| 3+ projects, multiple agents, same machine | Approach C (Beads for planning, Claude Code for execution) |
-| Multiple agents across machines | Adopt Beads fully (Approach A) |
-| Waiting for native support | Use Claude Code's Tasks as-is. Write CLAUDE.md handoff notes. |
+|---|---|
+| Any developer using AI agents | Adopt the orchestration principle: your system owns the workflow, agents are workers |
+| 1 project, short sessions | Claude Code's built-in tasks are fine. Keep a task list in your repo as fallback. |
+| 1 project, cross-session work | Approach D (simple orchestrator) or task list in repo. Approach B if committed to Claude. |
+| 2-3 projects | Approach D. Beads (Approach A) if you want a ready-made solution. |
+| Multiple agents across machines | Approach A (Beads) or Approach D with git-backed state. |
+| Committed to Claude Code only | Approach B (discovery tool) as tactical mitigation. Understand the coupling cost. |

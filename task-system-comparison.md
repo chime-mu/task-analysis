@@ -7,7 +7,7 @@ This document compares two approaches to AI-agent task management:
 - **Claude Code Tasks**: Claude Code v2.1.34 has **two mutually exclusive** task systems -- TodoWrite (solo/in-memory) and Tasks (team/swarm/persisted-to-disk) -- with a built-in team coordination layer
 - **Beads**: A persistent, git-native, multi-project issue tracker designed for multi-agent workflows
 
-The gap between these systems is narrower than a surface-level inspection suggests. Claude Code's swarm-mode Tasks system already provides file-based persistence, dependency tracking, multi-agent ownership, atomic claiming with file locking, and agent busy checks. However, Beads still operates at a fundamentally different scale in several dimensions.
+Within a single session, the gap between these systems is narrower than a surface-level inspection suggests. Claude Code's swarm-mode Tasks system provides file-based persistence, dependency tracking, multi-agent ownership, atomic claiming with file locking, and agent busy checks. However, **cross-session task continuity is fundamentally broken**: solo sessions scope task lists to random UUIDs (via `bR()`), making tasks undiscoverable after the session ends. File persistence exists, but practical persistence -- the ability to find and resume previous work -- does not. Beads still operates at a fundamentally different scale in several dimensions, and the cross-session gap is larger than previously documented.
 
 ---
 
@@ -33,7 +33,7 @@ This comparison focuses on the **Tasks system** (swarm mode) since it represents
 | Dimension | Claude Code Tasks (Swarm Mode) | Beads |
 |-----------|-------------------------------|-------|
 | **Scope** | Single machine, team of agents in one session | Multi-project, multi-agent, multi-org |
-| **Persistence** | **Yes** -- JSON files on disk (`~/.claude/tasks/{team}/`) | Yes -- SQLite + JSONL in git |
+| **Persistence** | **File-level only** -- JSON files on disk, but scoped to random UUIDs in solo mode; undiscoverable after session ends | Yes -- SQLite + JSONL in git |
 | **Storage** | Individual JSON files per task + file locking | SQLite + JSONL + optional Dolt |
 | **Data Model** | ~10 fields (id, subject, description, activeForm, status, owner, blocks, blockedBy, metadata) | ~40+ fields (full issue tracker) |
 | **ID System** | Auto-incrementing integers ("1", "2", "3") with highwatermark | Hash-based (`bd-a1b2`) |
@@ -42,7 +42,8 @@ This comparison focuses on the **Tasks system** (swarm mode) since it represents
 | **Multi-project** | No | Yes (multi-repo hydration, cross-project deps) |
 | **Multi-agent** | **Yes** -- team system with ownership, atomic claiming, file locking, agent busy checks, auto-unassign on shutdown | Yes -- hash IDs, atomic claims, agent-as-bead, hook pattern |
 | **Workflow Engine** | No | Yes (molecules, formulas, gates) |
-| **Cross-session** | **Partial** -- task files persist on disk, but no explicit resume protocol or ready computation | Yes (git-persisted, handoff protocols, `bd ready`) |
+| **Cross-session** | **Effectively none** without manual intervention (`--resume` or `CLAUDE_CODE_TASK_LIST_ID` env var) | Yes (git-persisted, handoff protocols, `bd ready`) |
+| **Crash recovery** | **None** -- tasks stuck in `in_progress` permanently; no cleanup, no discovery | Yes (git-persisted state survives any crash; `bd ready` recomputes) |
 | **Compaction** | None | Semantic memory decay (tier 1/2 compression) |
 | **Federation** | None | Yes (peer-to-peer via Dolt) |
 | **Git integration** | None -- filesystem only | Native (JSONL tracked in git, daemon syncs) |
@@ -57,15 +58,20 @@ This comparison focuses on the **Tasks system** (swarm mode) since it represents
 
 ### 1. Persistence and Lifecycle
 
-**Claude Code Tasks** are persistent in swarm/team mode. Each task is written as an individual JSON file at `~/.claude/tasks/{sanitized-team-name}/{id}.json`. The system uses `proper-lockfile` for concurrent access, maintains a `.highwatermark` file to ensure monotonically increasing IDs even after deletions, and supports a full CRUD lifecycle (create, read, update, delete, list, clear-all). Task files survive across process restarts within the same team context.
+**Claude Code Tasks** have **file persistence** but not **practical persistence**. Each task is written as an individual JSON file at `~/.claude/tasks/{sanitized-list-id}/{id}.json`. The system uses `proper-lockfile` for concurrent access, maintains a `.highwatermark` file to ensure monotonically increasing IDs even after deletions, and supports a full CRUD lifecycle (create, read, update, delete, list, clear-all). Task files survive across process restarts.
 
-However, this persistence is **team-scoped, not project-scoped**. Tasks are keyed by team name, not by working directory or git repository. There is no built-in mechanism to associate tasks with a specific project, resume tasks in a new session, or aggregate tasks across different teams/projects.
+However, **the task list ID is scoped to a random session UUID in solo mode**. The `nW()` function resolves the list ID through a priority chain: `CLAUDE_CODE_TASK_LIST_ID` env var -> teammate context -> team name -> manual name -> `bR()` (random UUIDv7). In solo sessions (the common case), this chain falls through to `bR()`, creating an isolated namespace like `~/.claude/tasks/019508a2-3f4e-...`. The next session generates a fresh UUID and has no way to discover the previous one.
 
-In contrast, the TodoWrite system (solo mode) is purely in-memory and vanishes when the session ends.
+This creates a critical distinction: **files persist, but they are undiscoverable**. Without knowing the exact UUID, there is no way to reconnect to a previous session's tasks. Three manual recovery paths exist:
+- **`--resume <sessionId>`**: Loads a previous session's transcript (whether it preserves the task list ID is unconfirmed from binary analysis)
+- **`--continue`**: Resumes the most recent session
+- **`CLAUDE_CODE_TASK_LIST_ID=<uuid>`**: Environment variable override that guarantees reconnection to a specific task directory
 
-**Beads** is fundamentally persistent and project-scoped. Issues are stored in SQLite for fast queries and exported to JSONL tracked in git. They survive across sessions, across machines, across teams. The daemon handles background sync, and the "Landing the Plane" protocol ensures agents push state before ending sessions. Compaction manages the long tail of old issues.
+In contrast, the TodoWrite system (solo mode, separate from Tasks) is purely in-memory and vanishes when the session ends.
 
-**Key difference**: Claude Code persists to local filesystem within a team context. Beads persists to git, enabling distribution, version history, and cross-machine access.
+**Beads** is fundamentally persistent and project-scoped. Issues are stored in SQLite for fast queries and exported to JSONL tracked in git. They survive across sessions, across machines, across teams. The daemon handles background sync, and the "Landing the Plane" protocol ensures agents push state before ending sessions. Compaction manages the long tail of old issues. Crucially, Beads issues are **discoverable** -- `bd ready` computes available work across all projects without requiring any session context.
+
+**Key difference**: Claude Code has file persistence but lacks practical persistence (discoverability, resume workflow, crash recovery). Beads has both file persistence and practical persistence via git and ready computation.
 
 ### 2. Data Model Complexity
 
@@ -141,11 +147,23 @@ This is a real coordination system with race-condition protection and graceful d
 
 ### 7. Cross-Session Continuity
 
-**Claude Code Tasks** persist to disk in swarm mode, so task files exist between sessions. However, there is no explicit resume mechanism. There is no `bd ready` equivalent, no session handoff protocol, and no compaction. A new session could theoretically read `~/.claude/tasks/{team}/` files, but the system does not expose this as a user-facing workflow.
+**Claude Code Tasks** persist to disk as JSON files, but cross-session continuity is **effectively broken** for solo users. The root cause: task lists are scoped to random UUIDs generated per session (`bR()`). A new session generates a fresh UUID, creates an empty task namespace, and has no way to discover previous sessions' tasks.
 
-**Beads** has full cross-session support: git-persisted state, `bd ready` for computing available work, the "Landing the Plane" protocol for clean session endings, and compaction for managing long-lived backlogs.
+Empirical analysis of `~/.claude/tasks/` reveals 15 UUID-named directories. Cross-referencing against `sessions-index.json` (which records session metadata for 2,508 sessions across 12 projects), only 5 of the 15 are traceable to known sessions. The remaining 10 are orphaned -- and all 10 are empty.
 
-**Key difference**: Claude Code has the persistence foundation but not the workflow built on top of it. Beads has both.
+Three manual recovery paths exist, each with significant limitations:
+
+1. **`--resume <sessionId>`**: Loads a previous session's transcript. Requires knowing the session ID. Whether it preserves the original task list ID is unconfirmed from binary analysis. No UI for browsing past sessions.
+2. **`--continue`**: Resumes the most recent session. Convenient but limited to exactly one session. Same uncertainty about task list reconnection.
+3. **`CLAUDE_CODE_TASK_LIST_ID=<uuid>`**: Environment variable that overrides the task list ID. This is the guaranteed escape hatch -- `CLAUDE_CODE_TASK_LIST_ID=<uuid> claude --resume <sessionId>` will reconnect to any task directory. But it requires the user to manually track and store UUIDs.
+
+**What does NOT exist**: There is no `/resume` slash command, no `TaskDiscover` tool, no CLI task browser, no way to list task directories with their contents, and no way to map a project to its associated task lists.
+
+**Crash behavior** further compounds the problem. If a session crashes, tasks in `in_progress` status remain stuck indefinitely. The `qn()` unassign-on-shutdown function only runs during graceful shutdowns. There is no crash recovery, no orphan detection, and no cleanup mechanism.
+
+**Beads** has full cross-session support: git-persisted state, `bd ready` for computing available work, the "Landing the Plane" protocol for clean session endings, and compaction for managing long-lived backlogs. Git persistence means Beads issues survive any crash -- the state is always recoverable.
+
+**Key difference**: Claude Code has file persistence but not practical persistence -- files survive but are undiscoverable without manual intervention. Beads has both file persistence and practical persistence, with automatic discoverability and crash resilience.
 
 ### 8. Context Management
 
@@ -179,7 +197,7 @@ The Claude Code task system in swarm mode is more than a thinking aid -- it is a
 - Graceful degradation via auto-unassign on shutdown
 - Background task monitoring via typed IDs and output files
 
-But it is deliberately **session-centric** and **machine-local**. It does not attempt to be a project management system, a version-controlled issue tracker, or a workflow engine. The intelligence is in the agents; the system provides just enough infrastructure for them to coordinate.
+But it is deliberately **session-centric** and **machine-local** -- and session-centricity implies **session-fragility**. Task lists are scoped to session UUIDs, so when a session ends (or crashes), the tasks become orphaned. The system provides just enough infrastructure for agents to coordinate within a single session, but does not attempt to bridge sessions, projects, or machines.
 
 ### Beads: Infrastructure-as-Workflow
 
@@ -192,22 +210,27 @@ Beads treats tasks as **persistent infrastructure**. Issues are first-class enti
 
 The intelligence is shared between agents and infrastructure.
 
+### The Missing Layer: Deterministic Orchestration
+
+Neither Claude Code Tasks nor Beads addresses the fundamental question of who drives the workflow. Both assume agents (or agent-like systems) make orchestration decisions. But agents are probabilistic -- they forget instructions, skip steps, and can't guarantee deterministic behavior. A third architectural option exists: a deterministic orchestration layer that treats agents as workers and manages workflow progression, crash recovery, and cross-session continuity through traditional software. In this framing, Claude Code's task system is a useful within-session helper (agents organizing their own work), not the orchestration layer. Beads is closer to the orchestration role but is still agent-oriented. See `orchestration-principle.md`.
+
 ---
 
 ## Where Claude Code Falls Short of Beads
 
 Despite having more capabilities than initially apparent, Claude Code's task system still lacks:
 
-1. **Multi-project awareness**: No concept of projects, no aggregated cross-project views
-2. **Cross-session ready computation**: No `bd ready` equivalent -- no way to ask "what work is available?"
-3. **Workflow templates**: No formulas, no reusable patterns, no gate steps
-4. **Git-native storage**: Filesystem JSON, not version-controlled, no distribution
-5. **Compaction / memory decay**: No management of long-lived task backlogs
-6. **Rich dependency types**: Only blocks/blockedBy, no conditional-blocks, waits-for, related, discovered-from
-7. **Agent self-monitoring**: No agent-as-bead pattern, no stuck/dead detection
-8. **Federation**: No cross-org synchronization
-9. **Content hashing**: No deduplication or convergent state detection
-10. **Cross-machine coordination**: File-locking only works for agents sharing a filesystem
+1. **Task discoverability / crash recovery**: Task lists are scoped to random session UUIDs; no way to browse, search, or reconnect to previous sessions' tasks without manually tracking UUIDs. Crashed sessions leave tasks stuck in `in_progress` permanently.
+2. **Multi-project awareness**: No concept of projects, no aggregated cross-project views
+3. **Cross-session ready computation**: No `bd ready` equivalent -- no way to ask "what work is available?"
+4. **Workflow templates**: No formulas, no reusable patterns, no gate steps
+5. **Git-native storage**: Filesystem JSON, not version-controlled, no distribution
+6. **Compaction / memory decay**: No management of long-lived task backlogs
+7. **Rich dependency types**: Only blocks/blockedBy, no conditional-blocks, waits-for, related, discovered-from
+8. **Agent self-monitoring**: No agent-as-bead pattern, no stuck/dead detection
+9. **Federation**: No cross-org synchronization
+10. **Content hashing**: No deduplication or convergent state detection
+11. **Cross-machine coordination**: File-locking only works for agents sharing a filesystem
 
 ---
 
@@ -215,7 +238,7 @@ Despite having more capabilities than initially apparent, Claude Code's task sys
 
 Areas where Claude Code's task system is more capable than a naive reading suggests:
 
-1. **Persistence**: Real file-based persistence in swarm mode (not ephemeral)
+1. **File persistence**: Real file-based persistence in swarm mode (not ephemeral), but undermined by session-scoped UUIDs that make tasks undiscoverable after the session ends
 2. **File locking**: `proper-lockfile` for atomic operations -- race-condition safe
 3. **Ownership model**: Explicit owner field with auto-assign on claim
 4. **Claim semantics**: Five distinct failure reasons (not_found, already_claimed, already_resolved, blocked, agent_busy)
@@ -251,6 +274,10 @@ Areas where Claude Code's task system is more capable than a naive reading sugge
 - Claude Code's swarm-mode Tasks manages in-session execution and agent coordination
 - An agent reads from `bd ready`, claims a Beads task, uses Claude Code's task system to coordinate subtask execution among team agents, then closes the Beads issue when done
 
+### When to Use Neither as Your Orchestration Layer
+
+If you need crash resilience, vendor independence, and deterministic workflow progression, neither Claude Code Tasks nor Beads should be your source of truth. Build or adopt a deterministic orchestration system that dispatches work to agents through their CLI interfaces. Let agents use their internal task systems for self-organization within sessions; the orchestrator tracks the real state. This is especially relevant when: you may switch between agent providers (Claude, Codex, open source), you need guaranteed crash recovery, or workflows must execute predictably (CI/CD, test suites, release processes). See `orchestration-principle.md`.
+
 ---
 
 ## Summary Table
@@ -259,8 +286,10 @@ Areas where Claude Code's task system is more capable than a naive reading sugge
 |---------|-------------------------|-------|--------|
 | Zero-friction start | Built-in, default on | Requires setup | Claude Code |
 | Single-session coordination | Excellent (file locking, ownership, busy checks) | Not designed for this | Claude Code |
-| Persistence | Yes (filesystem JSON) | Yes (SQLite + JSONL in git) | Beads (git > filesystem) |
-| Multi-session continuity | Partial (files persist, no resume workflow) | Excellent (ready, handoff, sync) | Beads |
+| Persistence (file-level) | Yes (filesystem JSON) | Yes (SQLite + JSONL in git) | Beads (git > filesystem) |
+| Persistence (practical / discoverable) | No -- session-scoped UUIDs, undiscoverable | Yes -- `bd ready`, git history | Beads |
+| Multi-session continuity | Effectively none without `--resume` or env var | Excellent (ready, handoff, sync) | Beads |
+| Crash recovery | None (tasks stuck in `in_progress` permanently) | Excellent (git-persisted state survives any crash) | Beads |
 | Multi-project view | None | Native | Beads |
 | Multi-agent (same machine) | Excellent (locking, claiming, auto-unassign) | Not specifically optimized for this | Claude Code |
 | Multi-agent (cross-machine) | None | Excellent (git-based) | Beads |
@@ -273,3 +302,4 @@ Areas where Claude Code's task system is more capable than a naive reading sugge
 | Agent self-monitoring | None | Agent-as-bead | Beads |
 | Learning curve | Zero | Moderate | Claude Code |
 | ID collision safety | Sequential + highwatermark (safe within team) | Hash-based (safe across organizations) | Beads |
+| Vendor independence | No (Claude-specific internals) | No (Beads-specific) | Neither (need external orchestrator) |
