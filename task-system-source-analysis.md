@@ -4,6 +4,8 @@
 **Build**: 2026-02-06T06:37:05Z
 **Method**: `strings` extraction + pattern-matched grep analysis of embedded JavaScript
 
+> **Note**: This document analyzes Claude Code's internal implementation. These are undocumented internals -- file paths, data formats, and behaviors may change between versions without notice. See `orchestration-principle.md` for strategic implications.
+
 ---
 
 ## Table of Contents
@@ -12,6 +14,7 @@
 2. [Two Distinct Systems: TodoWrite vs Tasks](#2-two-distinct-systems-todowrite-vs-tasks)
 3. [TodoWrite System (Solo Agent)](#3-todowrite-system-solo-agent)
 4. [Task System (Multi-Agent / Team)](#4-task-system-multi-agent--team)
+   - 4.3 [Task List Scoping & Session Isolation](#43-task-list-scoping--session-isolation)
 5. [Task Persistence Layer](#5-task-persistence-layer)
 6. [Task CRUD Tools](#6-task-crud-tools)
 7. [Task Dependency Resolution](#7-task-dependency-resolution)
@@ -250,7 +253,32 @@ function nW() {
 }
 ```
 
-The task list is identified by a "list ID" which is typically the team name. All agents in a team share the same task list.
+The task list is identified by a "list ID" resolved through a priority chain: environment variable override (`CLAUDE_CODE_TASK_LIST_ID`) -> teammate context (team name from AsyncLocalStorage) -> dynamic team name (`v7()`) -> manually set name (`nBA`) -> **random UUIDv7 via `bR()`**. In team/swarm mode, the team name typically provides the ID, so all agents share the same task list. In solo sessions, the chain falls through to `bR()`, which generates a random UUIDv7 per session -- meaning each solo session gets an isolated, undiscoverable task namespace. See Section 4.3 for the implications.
+
+### 4.3 Task List Scoping & Session Isolation
+
+In solo interactive sessions (the default mode), `nW()` falls through its entire priority chain to `bR()`, a UUIDv7 generator. This means:
+
+1. **Each session gets a random namespace.** The task list ID is a random UUID like `019508a2-3f4e-7b8c-9d1a-...`. Tasks created during that session are stored at `~/.claude/tasks/{uuid}/`. There is no connection to the working directory, git repository, or project name.
+
+2. **`nW()` never references `cwd` or `.git`.** The function's entire priority chain is: env var -> team context -> team name -> manual name -> random UUID. Project context is never consulted.
+
+3. **Files persist but become orphaned.** After a session ends, the task directory remains on disk but there is no index, no discovery mechanism, and no way for a subsequent session to find it. The new session generates a fresh UUID and creates a fresh, empty task namespace.
+
+4. **Empirical evidence.** Analysis of `~/.claude/tasks/` reveals 15 UUID-named directories. Cross-referencing against `~/.claude/projects/*/sessions-index.json` (which records `sessionId`, `projectPath`, `gitBranch`, `firstPrompt`, `summary`, and timestamps for 2,508 sessions across 12 projects), only 5 of the 15 directories are traceable to known sessions. The remaining 10 are orphans -- and all 10 are empty (contain only `.lock` and `.highwatermark` files, no task JSON).
+
+5. **Crash behavior.** If a session crashes or is interrupted, tasks in `in_progress` status remain stuck indefinitely. There is no cleanup mechanism, no crash recovery, and no way for the user to discover which sessions had unfinished work. The `qn()` unassign-on-shutdown function (Section 8.4) only runs during graceful shutdowns.
+
+6. **Recovery mechanisms.** Three partial mitigations exist:
+   - **`--resume <sessionId>`**: CLI flag that loads a previous session's transcript. Whether it preserves the original session ID (and thus reconnects to the same task list) is unconfirmed from binary analysis alone.
+   - **`--continue`**: Resumes the most recent session. Same uncertainty about task list reconnection.
+   - **`CLAUDE_CODE_TASK_LIST_ID=<uuid>`**: Environment variable override. This is the guaranteed escape hatch -- setting it to the UUID of an existing task directory will reconnect to that task list regardless of session ID. Usage: `CLAUDE_CODE_TASK_LIST_ID=<uuid> claude --resume <sessionId>`.
+
+7. **What does NOT exist.** There is no `/resume` slash command, no `TaskDiscover` tool, no CLI task browser, no way to list task directories with their contents, and no way to map a project or directory to its associated task lists. The `sessions-index.json` file records session metadata but has no link to task list IDs.
+
+**The critical distinction is file persistence vs practical persistence.** Task files survive on disk indefinitely, but without the ability to discover and reconnect to them, they are functionally ephemeral for the user.
+
+**Strategic implication**: The session-scoped nature of task lists, combined with the absence of any external API, reinforces that Claude Code's task system is an internal convenience layer, not an external interface to build on. See `orchestration-principle.md` for why orchestration should be independent of agent internals.
 
 ---
 
@@ -1324,6 +1352,7 @@ Key variable/function mappings discovered in the binary:
 | `COT` | Notify task change listeners |
 | `iBA` | Task change listener set |
 | `nBA` | Manually set task list name |
+| `bR` | UUIDv7 generator -- session ID fallback in `nW()` |
 | `EfT` | proper-lockfile module |
 | `T9T` | path module |
 | `eG` | fs module |
@@ -1368,7 +1397,8 @@ Key variable/function mappings discovered in the binary:
 | `oBA(listId, taskId, agent, opts)` | `(...) -> ClaimResult` | Claim task |
 | `SyD(listId, taskId, agent)` | `(string, string, string) -> ClaimResult` | Claim with busy check |
 | `qn(listId, agentId, agentName, reason)` | `(...) -> UnassignResult` | Unassign on shutdown |
-| `nW()` | `() -> string` | Get current task list ID |
+| `nW()` | `() -> string` | Get current task list ID (falls back to `bR()` in solo sessions) |
+| `bR()` | `() -> string` | Generate UUIDv7 (session ID / task list fallback) |
 | `zF(listId)` | `(string) -> string` | Get task directory path |
 | `LfT(listId, taskId)` | `(string, string) -> string` | Get task file path |
 | `KfT(listId)` | `(string) -> void` | Ensure directory exists |
